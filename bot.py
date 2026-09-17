@@ -859,7 +859,7 @@ async def start_web_server():
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.getenv("PORT", 10000))
-    site = web.TCPSite(runner, "0.0.0.0", port)
+    site = web.TCPSite(runner, "0.0.0.0", port, reuse_address=True, reuse_port=True)
     await site.start()
     logging.info(f"Health-сервер запущен на порту {port}")
 
