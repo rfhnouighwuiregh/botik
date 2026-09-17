@@ -40,6 +40,10 @@ from state import (
     set_flood_warnings_before_mute,
     increment_flood_warning,
     reset_flood_warning,
+    save_preset,
+    load_preset,
+    list_presets,
+    delete_preset,
 )
 
 load_dotenv()
@@ -285,6 +289,64 @@ async def cmd_sections(message: Message):
         lines.append(f"• {sec['name']} (id={tid}) — {status}, {rule}")
 
     await message.reply("\n".join(lines))
+
+
+# ============================================================
+# ПРЕСЕТЫ СЦЕНАРИЕВ — сохранить/загрузить все настройки разом
+# ============================================================
+@dp.message(Command("preset_save"))
+async def cmd_preset_save(message: Message, command: CommandObject):
+    if not await is_admin(message):
+        await message.reply("Только админ может это делать.")
+        return
+    if not command.args:
+        await message.reply("Формат: /preset_save <название>\nНапример: /preset_save вечеринка")
+        return
+    name = command.args.strip()
+    save_preset(state, name)
+    await message.reply(
+        f"Пресет '{name}' сохранён: текущие разделы, чёрный список, антифлуд и статус модерации.\n"
+        f"Применить позже: /preset_load {name}"
+    )
+
+
+@dp.message(Command("preset_load"))
+async def cmd_preset_load(message: Message, command: CommandObject):
+    if not await is_admin(message):
+        await message.reply("Только админ может это делать.")
+        return
+    if not command.args:
+        await message.reply("Формат: /preset_load <название>\nСписок сохранённых: /presets")
+        return
+    name = command.args.strip()
+    if load_preset(state, name):
+        await message.reply(f"Пресет '{name}' применён — разделы, чёрный список и антифлуд заменены на сохранённые.")
+    else:
+        await message.reply(f"Пресета '{name}' нет. Список сохранённых: /presets")
+
+
+@dp.message(Command("presets"))
+async def cmd_presets_list(message: Message):
+    names = list_presets(state)
+    if not names:
+        await message.reply("Пресетов пока нет. Сохранить текущие настройки: /preset_save <название>")
+        return
+    await message.reply("Сохранённые пресеты:\n" + "\n".join(f"• {n}" for n in names))
+
+
+@dp.message(Command("preset_delete"))
+async def cmd_preset_delete(message: Message, command: CommandObject):
+    if not await is_admin(message):
+        await message.reply("Только админ может это делать.")
+        return
+    if not command.args:
+        await message.reply("Формат: /preset_delete <название>")
+        return
+    name = command.args.strip()
+    if delete_preset(state, name):
+        await message.reply(f"Пресет '{name}' удалён.")
+    else:
+        await message.reply(f"Пресета '{name}' не было.")
 
 
 @dp.message(Command("types"))

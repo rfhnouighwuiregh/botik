@@ -1,11 +1,18 @@
 """
-Хранение состояния модерации в JSON-файле (state.json), чтобы
-настройки не сбрасывались при перезапуске бота.
+Хранение состояния модерации в Redis (Upstash), а не в локальном файле —
+на Render (и большинстве хостингов) файловая система эфемерна и
+сбрасывается при каждом передеплое/перезапуске. Redis живёт отдельно
+от контейнера бота и переживает любые передеплои.
+
+Нужны переменные окружения (заданные в .env локально и в Render →
+Environment на сервере):
+    UPSTASH_REDIS_REST_URL
+    UPSTASH_REDIS_REST_TOKEN
 
 Разделы больше НЕ прописываются в коде — они регистрируются
 командой /register прямо внутри нужной темы группы.
 
-Структура state.json:
+Структура состояния (хранится как один JSON-объект под ключом STATE_KEY):
 {
     "moderation_enabled": false,       # глобальный предохранитель
     "sections": {
@@ -24,7 +31,14 @@ import json
 import os
 import time
 
-STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
+from upstash_redis import Redis
+
+STATE_KEY = "moderator_bot_state"
+
+_redis = Redis(
+    url=os.getenv("UPSTASH_REDIS_REST_URL"),
+    token=os.getenv("UPSTASH_REDIS_REST_TOKEN"),
+)
 
 DEFAULT_STATE = {
     "moderation_enabled": False,  # предохранитель: по умолчанию ВЫКЛЮЧЕНО
@@ -39,35 +53,36 @@ DEFAULT_STATE = {
         "warnings_before_mute": 3,  # сколько предупреждений даётся перед мутом
     },
     "flood_warnings": {},  # {"<chat_id>": {"<user_id>": count}}
+    "presets": {},  # {"<название>": {снимок moderation_enabled/sections/blacklist/flood}}
 }
 
 
 def load_state() -> dict:
-    if not os.path.exists(STATE_FILE):
+    raw = _redis.get(STATE_KEY)
+    if raw is None:
         save_state(DEFAULT_STATE)
         return json.loads(json.dumps(DEFAULT_STATE))
 
-    with open(STATE_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-        data.setdefault("moderation_enabled", False)
-        data.setdefault("sections", {})
-        data.setdefault("muted_users", {})
-        data.setdefault("blacklist", [])
-        data.setdefault("flood", {
-            "enabled": False,
-            "mute_minutes": 5,
-            "max_messages": 5,
-            "window_seconds": 10,
-            "warnings_before_mute": 3,
-        })
-        data["flood"].setdefault("warnings_before_mute", 3)
-        data.setdefault("flood_warnings", {})
-        return data
+    data = json.loads(raw)
+    data.setdefault("moderation_enabled", False)
+    data.setdefault("sections", {})
+    data.setdefault("muted_users", {})
+    data.setdefault("blacklist", [])
+    data.setdefault("flood", {
+        "enabled": False,
+        "mute_minutes": 5,
+        "max_messages": 5,
+        "window_seconds": 10,
+        "warnings_before_mute": 3,
+    })
+    data["flood"].setdefault("warnings_before_mute", 3)
+    data.setdefault("flood_warnings", {})
+    data.setdefault("presets", {})
+    return data
 
 
 def save_state(state: dict) -> None:
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+    _redis.set(STATE_KEY, json.dumps(state, ensure_ascii=False))
 
 
 # ---------------- глобальный предохранитель ----------------
@@ -283,3 +298,47 @@ def reset_flood_warning(state: dict, chat_id: int, user_id: int) -> None:
     if str(user_id) in chat_warn:
         del chat_warn[str(user_id)]
         save_state(state)
+
+
+# ---------------- пресеты сценариев ----------------
+# Именованный снимок настроек модерации: разделы, чёрный список, антифлуд
+# и включена ли модерация. Хранится в том же Redis-состоянии — переживает
+# рестарты сервиса точно так же, как и текущие настройки.
+
+def save_preset(state: dict, name: str) -> None:
+    """Сохраняет ТЕКУЩИЕ настройки под именем name (перезаписывает, если уже было)."""
+    snapshot = {
+        "moderation_enabled": state.get("moderation_enabled", False),
+        "sections": json.loads(json.dumps(state.get("sections", {}))),
+        "blacklist": json.loads(json.dumps(state.get("blacklist", []))),
+        "flood": json.loads(json.dumps(state.get("flood", {}))),
+    }
+    state.setdefault("presets", {})[name] = snapshot
+    save_state(state)
+
+
+def load_preset(state: dict, name: str) -> bool:
+    """Применяет сохранённый пресет как текущие настройки. False, если пресета нет."""
+    presets = state.get("presets", {})
+    if name not in presets:
+        return False
+    snapshot = presets[name]
+    state["moderation_enabled"] = snapshot.get("moderation_enabled", False)
+    state["sections"] = json.loads(json.dumps(snapshot.get("sections", {})))
+    state["blacklist"] = json.loads(json.dumps(snapshot.get("blacklist", [])))
+    state["flood"] = json.loads(json.dumps(snapshot.get("flood", {})))
+    save_state(state)
+    return True
+
+
+def list_presets(state: dict) -> list:
+    return list(state.get("presets", {}).keys())
+
+
+def delete_preset(state: dict, name: str) -> bool:
+    presets = state.get("presets", {})
+    if name in presets:
+        del presets[name]
+        save_state(state)
+        return True
+    return False
