@@ -4,6 +4,7 @@ import os
 import time
 
 from dotenv import load_dotenv
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
 from aiogram.filters import Command, CommandObject
@@ -843,8 +844,29 @@ async def moderate(message: Message):
             logging.warning(f"Не удалось удалить сообщение: {e}")
 
 
+async def health(request):
+    return web.Response(text="OK")
+
+
+async def start_web_server():
+    """
+    Render (Web Service) требует открытый HTTP-порт, иначе считает
+    сервис нерабочим и может уходить в перезапуски. Этот сервер существует
+    только ради этого — сам бот работает через polling, не через вебхуки.
+    """
+    app = web.Application()
+    app.router.add_get("/health", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logging.info(f"Health-сервер запущен на порту {port}")
+
+
 async def main():
     logging.basicConfig(level=logging.INFO)
+    await start_web_server()
     await dp.start_polling(bot)
 
 
