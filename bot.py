@@ -856,7 +856,7 @@ async def start_web_server():
     """
     app = web.Application()
     app.router.add_get("/health", health)
-    runner = web.AppRunner(app)
+    runner = web.AppRunner(app, access_log=logging.getLogger("aiohttp.access"))
     await runner.setup()
     port = int(os.getenv("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port, reuse_address=True, reuse_port=True)
