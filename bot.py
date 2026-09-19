@@ -9,7 +9,6 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
 import aiohttp
-from aiogram.exceptions import SkipHandler
 from aiogram.filters import Command, CommandObject
 
 from rules import CONTENT_TYPES, get_content_types, is_message_allowed
@@ -835,25 +834,22 @@ async def ask_gemini(prompt: str) -> str:
         return "Не получилось получить ответ от ИИ, попробуй чуть позже."
 
 
-@dp.message(F.chat.type == "supergroup", F.text)
-async def handle_ai_mention(message: Message):
-    if not BOT_USERNAME or f"@{BOT_USERNAME.lower()}" not in message.text.lower():
-        raise SkipHandler  # не для нас — передаём дальше, в обычную модерацию
-
-    question = re.sub(f"@{re.escape(BOT_USERNAME)}", "", message.text, flags=re.IGNORECASE).strip()
-    if not question:
-        question = "Привет! Расскажи о себе коротко."
-
-    await bot.send_chat_action(message.chat.id, "typing")
-    answer = await ask_gemini(question)
-    await message.reply(answer)
-
-
 # ============================================================
 # ОСНОВНАЯ МОДЕРАЦИЯ
 # ============================================================
 @dp.message(F.chat.type == "supergroup")
 async def moderate(message: Message):
+    # ИИ-разговор через упоминание — работает всегда, даже если
+    # общая модерация (/start) выключена
+    if message.text and BOT_USERNAME and f"@{BOT_USERNAME.lower()}" in message.text.lower():
+        question = re.sub(f"@{re.escape(BOT_USERNAME)}", "", message.text, flags=re.IGNORECASE).strip()
+        if not question:
+            question = "Привет! Расскажи о себе коротко."
+        await bot.send_chat_action(message.chat.id, "typing")
+        answer = await ask_gemini(question)
+        await message.reply(answer)
+        return
+
     if not is_moderation_enabled(state):
         return  # предохранитель: модерация выключена целиком
 
