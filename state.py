@@ -61,6 +61,7 @@ DEFAULT_STATE = {
         "Фразы короткие, чёткие, без воды. Не терпишь глупостей, но по делу отвечаешь всегда "
         "и честно. Пишешь по-русски."
     ),
+    "known_users": {},  # {"username_в_нижнем_регистре": user_id} — своя база, см. remember_user
 }
 
 
@@ -86,6 +87,7 @@ def load_state() -> dict:
     data.setdefault("flood_warnings", {})
     data.setdefault("presets", {})
     data.setdefault("ai_persona", DEFAULT_STATE["ai_persona"])
+    data.setdefault("known_users", {})
     return data
 
 
@@ -210,6 +212,27 @@ def is_user_muted(state: dict, chat_id: int, user_id: int) -> bool:
         save_state(state)
         return False
     return True
+
+
+# ---------------- локальная база "username -> user_id" ----------------
+# bot.get_chat("@username") у Telegram надёжно резолвит только тех,
+# кто раньше писал боту в личку — а не всех, кто просто писал в группе.
+# Поэтому бот сам запоминает username -> user_id по каждому увиденному
+# сообщению в группе и потом резолвит по этой базе, а не через Telegram.
+
+def remember_user(state: dict, user_id: int, username: str | None) -> None:
+    if not username:
+        return
+    key = username.lower()
+    known = state.setdefault("known_users", {})
+    if known.get(key) == user_id:
+        return  # уже знаем — лишний раз не пишем в Redis
+    known[key] = user_id
+    save_state(state)
+
+
+def resolve_username_to_id(state: dict, username: str) -> int | None:
+    return state.get("known_users", {}).get(username.lstrip("@").lower())
 
 
 # ---------------- чёрный список слов ----------------

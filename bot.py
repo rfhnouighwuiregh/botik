@@ -48,6 +48,8 @@ from state import (
     delete_preset,
     get_ai_persona,
     set_ai_persona,
+    remember_user,
+    resolve_username_to_id,
 )
 
 load_dotenv()
@@ -192,8 +194,9 @@ async def resolve_target_user(message: Message, arg: str | None):
     Приоритет:
     1. Reply этой командой на сообщение нужного пользователя — самый надёжный способ.
     2. Числовой user_id в аргументе.
-    3. @username в аргументе (резолвится через Telegram, работает только если
-       у пользователя есть публичный @username).
+    3. @username в аргументе — сперва своя база (state.known_users, наполняется
+       автоматически из увиденных сообщений в группе), и только если там пусто —
+       запасной запрос bot.get_chat(), который у Telegram резолвит не всех.
     """
     # В темах (topics) Telegram сам подставляет reply_to_message = открывающее
     # сообщение темы почти для каждого сообщения, даже если реального ответа не было.
@@ -217,6 +220,11 @@ async def resolve_target_user(message: Message, arg: str | None):
         return int(arg), arg
 
     username = arg.lstrip("@")
+
+    known_id = resolve_username_to_id(state, username)
+    if known_id is not None:
+        return known_id, f"@{username}"
+
     try:
         chat = await bot.get_chat(f"@{username}")
         return chat.id, f"@{username}"
@@ -932,6 +940,12 @@ async def ask_gemini(prompt: str) -> str:
 # ============================================================
 @dp.message(F.chat.type == "supergroup")
 async def moderate(message: Message):
+    # Запоминаем @username -> user_id по каждому увиденному сообщению — это
+    # единственный надёжный способ резолвить пользователя по нику позже,
+    # т.к. bot.get_chat("@username") у Telegram работает не для всех.
+    if message.from_user:
+        remember_user(state, message.from_user.id, message.from_user.username)
+
     # ИИ-разговор через упоминание — работает всегда, даже если
     # общая модерация (/start) выключена
     if message.text and BOT_USERNAME and f"@{BOT_USERNAME.lower()}" in message.text.lower():
@@ -972,15 +986,18 @@ async def moderate(message: Message):
                 # Явная просьба админа замьютить третьего пользователя — доверяем,
                 # т.к. message.from_user проверен самим Telegram и не подделывается.
                 try:
-                    target_chat = await bot.get_chat(f"@{target_username}")
-                    if target_chat.id in admin_ids:
+                    target_id = resolve_username_to_id(state, target_username)
+                    if target_id is None:
+                        target_chat = await bot.get_chat(f"@{target_username}")
+                        target_id = target_chat.id
+                    if target_id in admin_ids:
                         await bot.send_message(
                             message.chat.id,
                             f"@{target_username} — админ, мьютить нельзя.",
                             message_thread_id=message.message_thread_id,
                         )
                     else:
-                        mute_user(state, message.chat.id, target_chat.id, f"@{target_username}", until=until)
+                        mute_user(state, message.chat.id, target_id, f"@{target_username}", until=until)
                         await bot.send_message(
                             message.chat.id,
                             f"@{target_username} замьючен на {mute_minutes} мин. по просьбе "
