@@ -195,7 +195,16 @@ async def resolve_target_user(message: Message, arg: str | None):
     3. @username в аргументе (резолвится через Telegram, работает только если
        у пользователя есть публичный @username).
     """
-    if message.reply_to_message and message.reply_to_message.from_user:
+    # В темах (topics) Telegram сам подставляет reply_to_message = открывающее
+    # сообщение темы почти для каждого сообщения, даже если реального ответа не было.
+    # Отличаем настоящий reply от этого автоматического: у фиктивного message_id
+    # совпадает с message_thread_id (это и есть ID открывающего сообщения темы).
+    is_real_reply = (
+        message.reply_to_message
+        and message.reply_to_message.from_user
+        and message.reply_to_message.message_id != message.message_thread_id
+    )
+    if is_real_reply:
         u = message.reply_to_message.from_user
         name = f"@{u.username}" if u.username else u.full_name
         return u.id, name
@@ -777,7 +786,11 @@ async def get_thread_id(message: Message):
 
 @dp.message(Command("ids"))
 async def get_sticker_id(message: Message):
-    if message.reply_to_message and message.reply_to_message.sticker:
+    is_real_reply = (
+        message.reply_to_message
+        and message.reply_to_message.message_id != message.message_thread_id
+    )
+    if is_real_reply and message.reply_to_message.sticker:
         sticker = message.reply_to_message.sticker
         await message.reply(
             f"file_unique_id стикера: {sticker.file_unique_id}\n"
@@ -793,10 +806,14 @@ async def cmd_whatis(message: Message):
     Диагностика: ответом (reply) на любое сообщение показывает,
     какими типами контента бот его считает (что уйдёт в проверку /allow).
     """
-    target = message.reply_to_message
-    if not target:
+    is_real_reply = (
+        message.reply_to_message
+        and message.reply_to_message.message_id != message.message_thread_id
+    )
+    if not is_real_reply:
         await message.reply("Ответь этой командой (reply) на сообщение, которое нужно проверить.")
         return
+    target = message.reply_to_message
 
     types = get_content_types(target)
     section = get_section(state, message.message_thread_id)
