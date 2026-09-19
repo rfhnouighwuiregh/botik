@@ -46,6 +46,8 @@ from state import (
     load_preset,
     list_presets,
     delete_preset,
+    get_ai_persona,
+    set_ai_persona,
 )
 
 load_dotenv()
@@ -812,11 +814,37 @@ async def cmd_whatis(message: Message):
 # ============================================================
 # ИИ-РАЗГОВОР ЧЕРЕЗ УПОМИНАНИЕ @БОТА (Google Gemini)
 # ============================================================
+# ============================================================
+# ИИ-РАЗГОВОР ЧЕРЕЗ УПОМИНАНИЕ @БОТА (Google Gemini)
+# ============================================================
+@dp.message(Command("ai_persona"))
+async def cmd_ai_persona_set(message: Message, command: CommandObject):
+    if not await is_admin(message):
+        await message.reply("Только админ может это менять.")
+        return
+    if not command.args:
+        await message.reply(
+            "Формат: /ai_persona <описание характера>\n"
+            "Текущий характер: /ai_persona_show"
+        )
+        return
+    set_ai_persona(state, command.args.strip())
+    await message.reply("Характер ИИ обновлён.")
+
+
+@dp.message(Command("ai_persona_show"))
+async def cmd_ai_persona_show(message: Message):
+    await message.reply(f"Текущий характер ИИ:\n\n{get_ai_persona(state)}")
+
+
 async def ask_gemini(prompt: str) -> str:
     if not GEMINI_API_KEY:
         return "ИИ пока не настроен — не хватает GEMINI_API_KEY в переменных окружения."
 
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    payload = {
+        "systemInstruction": {"parts": [{"text": get_ai_persona(state)}]},
+        "contents": [{"parts": [{"text": prompt}]}],
+    }
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(

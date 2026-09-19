@@ -54,6 +54,13 @@ DEFAULT_STATE = {
     },
     "flood_warnings": {},  # {"<chat_id>": {"<user_id>": count}}
     "presets": {},  # {"<название>": {снимок moderation_enabled/sections/blacklist/flood}}
+    "ai_persona": (
+        "Ты — женщина-администратор этого чата с большим стажем модерации. "
+        "Отвечаешь властно, уверенно, слегка свысока — как человек, который здесь главный "
+        "и повидал уже всякое. Держишься строго, без заискивания, но с сухим чувством юмора. "
+        "Фразы короткие, чёткие, без воды. Не терпишь глупостей, но по делу отвечаешь всегда "
+        "и честно. Пишешь по-русски."
+    ),
 }
 
 
@@ -78,6 +85,7 @@ def load_state() -> dict:
     data["flood"].setdefault("warnings_before_mute", 3)
     data.setdefault("flood_warnings", {})
     data.setdefault("presets", {})
+    data.setdefault("ai_persona", DEFAULT_STATE["ai_persona"])
     return data
 
 
@@ -342,3 +350,14 @@ def delete_preset(state: dict, name: str) -> bool:
         save_state(state)
         return True
     return False
+
+
+# ---------------- характер ИИ ----------------
+
+def get_ai_persona(state: dict) -> str:
+    return state.get("ai_persona", DEFAULT_STATE["ai_persona"])
+
+
+def set_ai_persona(state: dict, persona: str) -> None:
+    state["ai_persona"] = persona
+    save_state(state)
