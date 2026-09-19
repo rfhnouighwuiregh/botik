@@ -837,25 +837,40 @@ async def cmd_ai_persona_show(message: Message):
     await message.reply(f"Текущий характер ИИ:\n\n{get_ai_persona(state)}")
 
 
-MUTE_MARKER_RE = re.compile(r"\[MUTE:(\d+)\]", re.IGNORECASE)
+AI_MUTE_COMMAND_RE = re.compile(r"/mute\s+(@\w+)\s+(\d{1,2})", re.IGNORECASE)
 
 AI_MUTE_PROTOCOL = (
     "У тебя есть право временно мьютить (затыкать) того, кто тебе написал, если он тебе "
     "грубит, оскорбляет или ведёт себя неуважительно — решаешь полностью сама, по своему "
-    "усмотрению. Если решила замьютить автора сообщения, в самом конце своего ответа "
-    "добавь метку [MUTE:N], где N — число минут мьюта, от 1 до 5 (например [MUTE:3]). "
-    "Если мьютить не хочешь — просто не добавляй метку. Метка нужна ровно в этом формате, "
-    "её вырежут из текста перед отправкой, пользователь её не увидит."
+    "усмотрению. В начале каждого сообщения тебе будет указан юзернейм автора в формате "
+    "[от @username]. Если решила замьютить его, на отдельной строке в конце своего ответа "
+    "напиши ровно: /mute @username N — где @username это тот самый юзернейм автора, а N — "
+    "число минут мьюта, от 1 до 5 (например /mute @ivan_petrov 3). Если мьютить не хочешь — "
+    "просто не пиши эту строку. Формат обязателен именно такой, эту строку вырежут из текста "
+    "перед отправкой, пользователь её не увидит."
 )
 
 
-def parse_mute_marker(text: str) -> tuple:
-    """Возвращает (текст_без_метки, минуты_или_None)."""
-    match = MUTE_MARKER_RE.search(text)
+def parse_mute_command(text: str, sender_username: str | None) -> tuple:
+    """
+    Возвращает (текст_без_команды, минуты_или_None).
+    Мьют применяется только если юзернейм в команде ИИ совпадает
+    с реальным автором сообщения — так модель не может замьютить кого-то другого.
+    """
+    match = AI_MUTE_COMMAND_RE.search(text)
     if not match:
         return text.strip(), None
-    minutes = max(1, min(int(match.group(1)), 5))  # ограничиваем 1–5 минут на всякий случай
-    clean_text = MUTE_MARKER_RE.sub("", text).strip()
+
+    clean_text = AI_MUTE_COMMAND_RE.sub("", text).strip()
+    target_username = match.group(1).lstrip("@").lower()
+
+    if not sender_username or target_username != sender_username.lstrip("@").lower():
+        logging.warning(
+            f"ИИ попыталась замьютить @{target_username}, но это не автор сообщения (@{sender_username}) — игнорирую."
+        )
+        return clean_text, None
+
+    minutes = max(1, min(int(match.group(2)), 5))  # ограничиваем 1–5 минут на всякий случай
     return clean_text, minutes
 
 
@@ -895,15 +910,19 @@ async def moderate(message: Message):
         question = re.sub(f"@{re.escape(BOT_USERNAME)}", "", message.text, flags=re.IGNORECASE).strip()
         if not question:
             question = "Привет! Расскажи о себе коротко."
+
+        sender_username = message.from_user.username if message.from_user else None
+        prompt = f"[от @{sender_username}]: {question}" if sender_username else question
+
         await bot.send_chat_action(message.chat.id, "typing")
-        answer = await ask_gemini(question)
-        clean_answer, mute_minutes = parse_mute_marker(answer)
+        answer = await ask_gemini(prompt)
+        clean_answer, mute_minutes = parse_mute_command(answer, sender_username)
         await message.reply(clean_answer)
 
         if mute_minutes and message.from_user:
             admin_ids = await get_admin_ids(message.chat.id)
             if message.from_user.id not in admin_ids:
-                name = f"@{message.from_user.username}" if message.from_user.username else message.from_user.full_name
+                name = f"@{sender_username}" if sender_username else message.from_user.full_name
                 until = time.time() + mute_minutes * 60
                 mute_user(state, message.chat.id, message.from_user.id, name, until=until)
                 try:
