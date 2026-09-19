@@ -1,12 +1,15 @@
 import asyncio
 import logging
 import os
+import re
 import time
 
 from dotenv import load_dotenv
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
+import aiohttp
+from aiogram.exceptions import SkipHandler
 from aiogram.filters import Command, CommandObject
 
 from rules import CONTENT_TYPES, get_content_types, is_message_allowed
@@ -56,6 +59,12 @@ if not BOT_TOKEN:
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = "gemini-2.5-flash-lite"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+
+BOT_USERNAME = None  # заполняется в main() при старте, до этого момента неизвестен
 
 state = load_state()
 
@@ -802,6 +811,45 @@ async def cmd_whatis(message: Message):
 
 
 # ============================================================
+# ИИ-РАЗГОВОР ЧЕРЕЗ УПОМИНАНИЕ @БОТА (Google Gemini)
+# ============================================================
+async def ask_gemini(prompt: str) -> str:
+    if not GEMINI_API_KEY:
+        return "ИИ пока не настроен — не хватает GEMINI_API_KEY в переменных окружения."
+
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{GEMINI_URL}?key={GEMINI_API_KEY}",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                data = await resp.json()
+                if resp.status != 200:
+                    logging.warning(f"Gemini вернул ошибку {resp.status}: {data}")
+                    return "Не получилось получить ответ от ИИ, попробуй чуть позже."
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception as e:
+        logging.warning(f"Запрос к Gemini не удался: {e}")
+        return "Не получилось получить ответ от ИИ, попробуй чуть позже."
+
+
+@dp.message(F.chat.type == "supergroup", F.text)
+async def handle_ai_mention(message: Message):
+    if not BOT_USERNAME or f"@{BOT_USERNAME.lower()}" not in message.text.lower():
+        raise SkipHandler  # не для нас — передаём дальше, в обычную модерацию
+
+    question = re.sub(f"@{re.escape(BOT_USERNAME)}", "", message.text, flags=re.IGNORECASE).strip()
+    if not question:
+        question = "Привет! Расскажи о себе коротко."
+
+    await bot.send_chat_action(message.chat.id, "typing")
+    answer = await ask_gemini(question)
+    await message.reply(answer)
+
+
+# ============================================================
 # ОСНОВНАЯ МОДЕРАЦИЯ
 # ============================================================
 @dp.message(F.chat.type == "supergroup")
@@ -927,7 +975,11 @@ async def start_web_server():
 
 
 async def main():
+    global BOT_USERNAME
     logging.basicConfig(level=logging.INFO)
+    me = await bot.get_me()
+    BOT_USERNAME = me.username
+    logging.info(f"Бот запущен как @{BOT_USERNAME}")
     await start_web_server()
     await dp.start_polling(bot)
 
