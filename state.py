@@ -186,11 +186,24 @@ def get_muted_users(state: dict, chat_id: int) -> dict:
     return state.setdefault("muted_users", {}).setdefault(str(chat_id), {})
 
 
-def mute_user(state: dict, chat_id: int, user_id: int, name: str, until: float | None = None) -> None:
-    """until — unix-время, когда мьют истекает сам. None — бессрочно (ручной /mute)."""
+def mute_user(state: dict, chat_id: int, user_id: int, name: str, until: float | None = None, source: str = "admin") -> None:
+    """
+    until — unix-время, когда мьют истекает сам. None — бессрочно (ручной /mute).
+    source — кто выдал мьют: "admin" (ручной /mute), "flood" (антифлуд) или "ai" (решение ИИ).
+    Нужен, чтобы ИИ не могла сама снять мьют, выданный админом, просто приняв извинения.
+    """
     chat_muted = state.setdefault("muted_users", {}).setdefault(str(chat_id), {})
-    chat_muted[str(user_id)] = {"name": name, "until": until}
+    chat_muted[str(user_id)] = {"name": name, "until": until, "source": source}
     save_state(state)
+
+
+def get_mute_source(state: dict, chat_id: int, user_id: int) -> str | None:
+    """Возвращает источник текущего мьюта ("admin"/"flood"/"ai") или None, если не замьючен."""
+    chat_muted = state.get("muted_users", {}).get(str(chat_id), {})
+    entry = chat_muted.get(str(user_id))
+    if not entry:
+        return None
+    return entry.get("source", "admin")  # старые записи без source считаем ручными
 
 
 def unmute_user(state: dict, chat_id: int, user_id: int) -> bool:
