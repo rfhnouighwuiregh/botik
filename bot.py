@@ -50,6 +50,8 @@ from state import (
     set_ai_persona,
     remember_user,
     resolve_username_to_id,
+    log_user_message,
+    get_user_message_log,
 )
 
 load_dotenv()
@@ -905,6 +907,7 @@ async def cmd_ai_persona_show(message: Message):
 
 
 AI_MUTE_COMMAND_RE = re.compile(r"/mute\s+(@\w+)\s+(\d{1,2})", re.IGNORECASE)
+AI_UNMUTE_COMMAND_RE = re.compile(r"/unmute\s+(@\w+)", re.IGNORECASE)
 
 AI_MUTE_PROTOCOL = (
     "У тебя есть два повода написать команду мьюта:\n"
@@ -916,8 +919,23 @@ AI_MUTE_PROTOCOL = (
     "Если решила замьютить — на отдельной строке в конце своего ответа напиши ровно: "
     "/mute @username N — где @username это тот, кого мьютим (себя-обидчика или того, кого "
     "попросил замьютить админ), а N — число минут мьюта, от 1 до 5 (например /mute @ivan_petrov 3). "
-    "Если мьютить не хочешь — просто не пиши эту строку. Формат обязателен именно такой, "
-    "эту строку вырежут из текста перед отправкой, пользователь её не увидит."
+    "Если мьютить не хочешь — просто не пиши эту строку.\n\n"
+    "Симметрично есть два повода написать команду размута:\n"
+    "1) Прощение по своему усмотрению: если тебе пишет тот же самый человек, которого ты (или "
+    "кто-то) замьютил, и он извиняется или просит войти в положение — можешь простить и снять "
+    "мут именно с НЕГО, если считаешь это уместным, а можешь и отказать, решаешь сама. Если "
+    "в сообщении тебе показана история его последних сообщений — обязательно опирайся на неё: "
+    "если там реально есть спам, оскорбления, реклама или другое явное нарушение — откажи и "
+    "коротко напиши, что именно смущает (без цитирования лишнего). Если ничего подозрительного "
+    "в истории нет — прости и добавь в ответе, что мут, возможно, был ошибкой или перестраховкой "
+    "админа. Если истории не показали вообще — решай просто по тону текущего сообщения.\n"
+    "2) Явная просьба админа: если автор — админ и просит снять мут с конкретного @username — "
+    "выполняй, указав именно того, кого он назвал.\n"
+    "Если решила размутить — на отдельной строке в конце ответа напиши ровно: /unmute @username "
+    "(без числа минут). Если размучивать не хочешь — просто не пиши эту строку.\n\n"
+    "Обе команды взаимоисключающие — в одном ответе пиши не больше одной строки-команды. "
+    "Формат обязателен именно такой, эту строку вырежут из текста перед отправкой, "
+    "пользователь её не увидит."
 )
 
 
@@ -935,6 +953,17 @@ def parse_mute_command(text: str) -> tuple:
     target_username = match.group(1).lstrip("@").lower()
     minutes = max(1, min(int(match.group(2)), 5))  # ограничиваем 1–5 минут на всякий случай
     return clean_text, target_username, minutes
+
+
+def parse_unmute_command(text: str) -> tuple:
+    """Возвращает (текст_без_команды, target_username_или_None) — аналог parse_mute_command."""
+    match = AI_UNMUTE_COMMAND_RE.search(text)
+    if not match:
+        return text.strip(), None
+
+    clean_text = AI_UNMUTE_COMMAND_RE.sub("", text).strip()
+    target_username = match.group(1).lstrip("@").lower()
+    return clean_text, target_username
 
 
 async def ask_gemini(prompt: str) -> str:
@@ -973,6 +1002,14 @@ async def moderate(message: Message):
     if message.from_user:
         remember_user(state, message.from_user.id, message.from_user.username)
 
+    # Журнал последних сообщений — чтобы при просьбе об амнистии ИИ могла
+    # посмотреть, было ли реальное нарушение, а не просто поверить на слово
+    # текущей просьбе простить. Админов не логируем — их не мьютят.
+    if message.from_user and message.text:
+        admin_ids_for_log = await get_admin_ids(message.chat.id)
+        if message.from_user.id not in admin_ids_for_log:
+            log_user_message(state, message.chat.id, message.from_user.id, message.text)
+
     # ИИ-разговор через упоминание — работает всегда, даже если
     # общая модерация (/start) выключена
     if message.text and BOT_USERNAME and f"@{BOT_USERNAME.lower()}" in message.text.lower():
@@ -981,67 +1018,129 @@ async def moderate(message: Message):
             question = "Привет! Расскажи о себе коротко."
 
         sender_username = message.from_user.username if message.from_user else None
-        prompt = f"[от @{sender_username}]: {question}" if sender_username else question
+
+        history_note = ""
+        if message.from_user and is_user_muted(state, message.chat.id, message.from_user.id):
+            history = get_user_message_log(state, message.chat.id, message.from_user.id)
+            if history:
+                history_text = "\n".join(f"- {h}" for h in history)
+                history_note = (
+                    f"\n\n[Автор сейчас в муте. Вот его последние сообщения до мьюта — "
+                    f"используй их, если он просит амнистию:\n{history_text}]"
+                )
+
+        prompt = f"[от @{sender_username}]: {question}{history_note}" if sender_username else f"{question}{history_note}"
 
         await bot.send_chat_action(message.chat.id, "typing")
         answer = await ask_gemini(prompt)
         clean_answer, target_username, mute_minutes = parse_mute_command(answer)
+        unmute_target = None
+        if target_username is None:
+            clean_answer, unmute_target = parse_unmute_command(clean_answer)
 
         # Важно: НЕ отвечаем текстом ИИ сразу. Он может написать "Сделано" ещё
-        # до того, как мы проверили права и реально что-то замьютили — тогда
+        # до того, как мы проверили права и реально что-то сделали — тогда
         # бот соврёт про результат. Сначала проверяем права и выполняем
         # действие (если оно вообще запрошено и разрешено), и только потом
         # шлём ровно один ответ, соответствующий тому, что произошло на самом деле.
-        if not (target_username and mute_minutes and message.from_user):
+        if not message.from_user or not (target_username and mute_minutes or unmute_target):
             await message.reply(clean_answer)
-            return
-
-        admin_ids = await get_admin_ids(message.chat.id)
-        sender_is_admin = message.from_user.id in admin_ids
-        sender_username_norm = (sender_username or "").lower()
-        until = time.time() + mute_minutes * 60
-
-        if target_username == sender_username_norm:
-            # Самозащита: ИИ мьютит самого автора за грубость. Админа мьютить нельзя.
-            if sender_is_admin:
-                logging.info("ИИ решила замьютить админа за грубость — игнорирую.")
-                await message.reply(clean_answer)
-            else:
-                name = f"@{sender_username}" if sender_username else message.from_user.full_name
-                mute_user(state, message.chat.id, message.from_user.id, name, until=until)
-                await message.reply(clean_answer)  # мут реально выполнен — текст ИИ соответствует правде
-        elif sender_is_admin:
-            # Явная просьба админа замьютить третьего пользователя — доверяем,
-            # т.к. message.from_user проверен самим Telegram и не подделывается.
-            try:
-                target_id = resolve_username_to_id(state, target_username)
-                if target_id is None:
-                    target_chat = await bot.get_chat(f"@{target_username}")
-                    target_id = target_chat.id
-                if target_id in admin_ids:
-                    await message.reply(f"@{target_username} — админ, мьютить нельзя.")
-                else:
-                    mute_user(state, message.chat.id, target_id, f"@{target_username}", until=until)
-                    await message.reply(clean_answer)  # мут реально выполнен — текст ИИ соответствует правде
-            except Exception as e:
-                logging.warning(f"Не удалось замьютить @{target_username} по просьбе админа: {e}")
-                await message.reply(
-                    f"Не получилось замьютить @{target_username} — бот его ещё не знает "
-                    f"(нужно, чтобы он раньше уже писал в группе). Надёжнее: ответь (reply) "
-                    f"на его сообщение командой /mute {mute_minutes}."
-                )
         else:
-            # Не-админ просит замьютить кого-то другого — отказываем и НЕ показываем
-            # текст ИИ (он мог уже написать "сделано", хотя действие запрещено).
-            logging.warning(
-                f"ИИ попыталась замьютить @{target_username} по просьбе не-админа "
-                f"(@{sender_username}) — игнорирую."
-            )
-            await message.reply(
-                f"@{sender_username}, у тебя не хватает авторитета, чтобы просить о таком."
-                if sender_username else
-                "У тебя не хватает авторитета, чтобы просить о таком."
-            )
+            admin_ids = await get_admin_ids(message.chat.id)
+            sender_is_admin = message.from_user.id in admin_ids
+            sender_username_norm = (sender_username or "").lower()
+
+            if target_username and mute_minutes:
+                until = time.time() + mute_minutes * 60
+                if target_username == sender_username_norm:
+                    # Самозащита: ИИ мьютит самого автора за грубость. Админа мьютить нельзя.
+                    if sender_is_admin:
+                        logging.info("ИИ решила замьютить админа за грубость — игнорирую.")
+                        await message.reply(clean_answer)
+                    else:
+                        name = f"@{sender_username}" if sender_username else message.from_user.full_name
+                        mute_user(state, message.chat.id, message.from_user.id, name, until=until)
+                        await message.reply(clean_answer)  # мут реально выполнен — текст ИИ соответствует правде
+                elif sender_is_admin:
+                    # Явная просьба админа замьютить третьего пользователя — доверяем,
+                    # т.к. message.from_user проверен самим Telegram и не подделывается.
+                    try:
+                        target_id = resolve_username_to_id(state, target_username)
+                        if target_id is None:
+                            target_chat = await bot.get_chat(f"@{target_username}")
+                            target_id = target_chat.id
+                        if target_id in admin_ids:
+                            await message.reply(f"@{target_username} — админ, мьютить нельзя.")
+                        else:
+                            mute_user(state, message.chat.id, target_id, f"@{target_username}", until=until)
+                            await message.reply(clean_answer)  # мут реально выполнен — текст ИИ соответствует правде
+                    except Exception as e:
+                        logging.warning(f"Не удалось замьютить @{target_username} по просьбе админа: {e}")
+                        await message.reply(
+                            f"Не получилось замьютить @{target_username} — бот его ещё не знает "
+                            f"(нужно, чтобы он раньше уже писал в группе). Надёжнее: ответь (reply) "
+                            f"на его сообщение командой /mute {mute_minutes}."
+                        )
+                else:
+                    # Не-админ просит замьютить кого-то другого — отказываем и НЕ показываем
+                    # текст ИИ (он мог уже написать "сделано", хотя действие запрещено).
+                    logging.warning(
+                        f"ИИ попыталась замьютить @{target_username} по просьбе не-админа "
+                        f"(@{sender_username}) — игнорирую."
+                    )
+                    await message.reply(
+                        f"@{sender_username}, у тебя не хватает авторитета, чтобы просить о таком."
+                        if sender_username else
+                        "У тебя не хватает авторитета, чтобы просить о таком."
+                    )
+            else:
+                # unmute_target задан (ветка мьюта выше не подошла)
+                if unmute_target == sender_username_norm and not sender_is_admin:
+                    # Прощение по усмотрению ИИ — но только реально замьюченного, а не любого желающего.
+                    if is_user_muted(state, message.chat.id, message.from_user.id):
+                        unmute_user(state, message.chat.id, message.from_user.id)
+                        await message.reply(clean_answer)  # размут реально выполнен — текст ИИ соответствует правде
+                    else:
+                        await message.reply("Ты и так не в муте.")
+                elif sender_is_admin:
+                    # Явная просьба админа снять мут с конкретного пользователя — доверяем.
+                    try:
+                        target_id = resolve_username_to_id(state, unmute_target)
+                        if target_id is None:
+                            target_chat = await bot.get_chat(f"@{unmute_target}")
+                            target_id = target_chat.id
+                        if unmute_user(state, message.chat.id, target_id):
+                            await message.reply(clean_answer)  # размут реально выполнен
+                        else:
+                            await message.reply(f"@{unmute_target} и так не в муте.")
+                    except Exception as e:
+                        logging.warning(f"Не удалось размутить @{unmute_target} по просьбе админа: {e}")
+                        await message.reply(
+                            f"Не получилось размутить @{unmute_target} — бот его ещё не знает. "
+                            f"Надёжнее: команда /unmute с явным @username или id."
+                        )
+                else:
+                    # Не-админ просит размутить кого-то другого (не себя) — отказываем.
+                    logging.warning(
+                        f"ИИ попыталась размутить @{unmute_target} по просьбе не-админа "
+                        f"(@{sender_username}) — игнорирую."
+                    )
+                    await message.reply(
+                        f"@{sender_username}, у тебя не хватает авторитета, чтобы просить о таком."
+                        if sender_username else
+                        "У тебя не хватает авторитета, чтобы просить о таком."
+                    )
+
+        # Мьют здесь реализован не через права Telegram, а через удаление
+        # сообщений замьюченных в остальном коде — значит, упоминание бота
+        # было бы единственной лазейкой, которую не удаляют. Поэтому если
+        # автор к этому моменту всё ещё в муте (не выпросил прощение выше),
+        # прячем его сообщение так же, как спрятали бы любое другое.
+        if message.from_user and is_user_muted(state, message.chat.id, message.from_user.id):
+            try:
+                await message.delete()
+            except Exception as e:
+                logging.warning(f"Не удалось удалить сообщение замьюченного после ответа ИИ: {e}")
         return
 
     if not is_moderation_enabled(state):

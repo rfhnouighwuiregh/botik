@@ -62,6 +62,7 @@ DEFAULT_STATE = {
         "и честно. Пишешь по-русски."
     ),
     "known_users": {},  # {"username_в_нижнем_регистре": user_id} — своя база, см. remember_user
+    "message_log": {},  # {chat_id: {user_id: [последние сообщения]}} — см. log_user_message
 }
 
 
@@ -88,6 +89,7 @@ def load_state() -> dict:
     data.setdefault("presets", {})
     data.setdefault("ai_persona", DEFAULT_STATE["ai_persona"])
     data.setdefault("known_users", {})
+    data.setdefault("message_log", {})
     return data
 
 
@@ -233,6 +235,29 @@ def remember_user(state: dict, user_id: int, username: str | None) -> None:
 
 def resolve_username_to_id(state: dict, username: str) -> int | None:
     return state.get("known_users", {}).get(username.lstrip("@").lower())
+
+
+# ---------------- журнал последних сообщений (для оценки амнистии ИИ) ----------------
+# Хранит немного последних сообщений каждого пользователя, чтобы при просьбе
+# о прощении ИИ могла посмотреть, было ли реальное нарушение, а не просто
+# поверить на слово текущему сообщению с извинениями.
+
+MESSAGE_LOG_MAX = 15  # сколько последних сообщений храним на пользователя в чате
+
+
+def log_user_message(state: dict, chat_id: int, user_id: int, text: str) -> None:
+    if not text:
+        return
+    chat_log = state.setdefault("message_log", {}).setdefault(str(chat_id), {})
+    log = chat_log.setdefault(str(user_id), [])
+    log.append(text[:300])  # обрезаем — не нужно тащить в Redis гигантские сообщения целиком
+    if len(log) > MESSAGE_LOG_MAX:
+        del log[: len(log) - MESSAGE_LOG_MAX]
+    save_state(state)
+
+
+def get_user_message_log(state: dict, chat_id: int, user_id: int) -> list:
+    return state.get("message_log", {}).get(str(chat_id), {}).get(str(user_id), [])
 
 
 # ---------------- чёрный список слов ----------------
