@@ -422,3 +422,28 @@ def get_ai_persona(state: dict) -> str:
 def set_ai_persona(state: dict, persona: str) -> None:
     state["ai_persona"] = persona
     save_state(state)
+
+
+# ---------------- табель нарушений ----------------
+# Считаем каждое удаление сообщения / мьют за проступок — накопительно
+# на пользователя в чате. Отдельно от muted_users, живёт своей жизнью.
+
+def record_violation(state: dict, chat_id: int, user_id: int, name: str, reason: str) -> None:
+    chat_violations = state.setdefault("violations", {}).setdefault(str(chat_id), {})
+    entry = chat_violations.setdefault(str(user_id), {"name": name, "count": 0, "last_reason": ""})
+    entry["count"] += 1
+    entry["name"] = name  # на случай смены ника
+    entry["last_reason"] = reason
+    save_state(state)
+
+
+def get_violations(state: dict, chat_id: int) -> dict:
+    return state.get("violations", {}).get(str(chat_id), {})
+
+
+def reset_violations(state: dict, chat_id: int, user_id: int | None = None) -> None:
+    if user_id is None:
+        state.setdefault("violations", {})[str(chat_id)] = {}
+    else:
+        state.get("violations", {}).get(str(chat_id), {}).pop(str(user_id), None)
+    save_state(state)
