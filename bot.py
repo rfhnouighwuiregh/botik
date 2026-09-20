@@ -103,6 +103,16 @@ _repeat_tracker: dict[tuple[int, int], tuple] = {}   # (chat,user) -> (текс�
 _mention_tracker: dict[tuple[int, int], tuple] = {}  # (chat,user) -> (@юзернейм, подряд)
 
 
+def _plural_ru(n: int, one: str, few: str, many: str) -> str:
+    """Русское склонение по числу: 1 попытка, 2-4 попытки, 5-20 попыток, 21 попытка..."""
+    n = abs(n)
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not (12 <= n % 100 <= 14):
+        return few
+    return many
+
+
 def _is_flooding(chat_id: int, user_id: int) -> bool:
     max_messages, window_seconds = get_flood_limits(state)
     now = time.time()
@@ -857,6 +867,9 @@ async def cmd_whatis(message: Message):
 # ============================================================
 # ИИ-РАЗГОВОР ЧЕРЕЗ УПОМИНАНИЕ @БОТА (Google Gemini)
 # ============================================================
+AI_PERSONA_MAX_LEN = 800  # запас с учётом лимита Telegram (4096) и того, что текст ещё едет в промпт Gemini
+
+
 @dp.message(Command("ai_persona"))
 async def cmd_ai_persona_set(message: Message, command: CommandObject):
     if not await is_admin(message):
@@ -868,13 +881,27 @@ async def cmd_ai_persona_set(message: Message, command: CommandObject):
             "Текущий характер: /ai_persona_show"
         )
         return
-    set_ai_persona(state, command.args.strip())
+    persona = command.args.strip()
+    if len(persona) > AI_PERSONA_MAX_LEN:
+        await message.reply(
+            f"Слишком длинно: {len(persona)} символов, максимум {AI_PERSONA_MAX_LEN}. "
+            f"Сократи описание характера и пришли ещё раз."
+        )
+        return
+    set_ai_persona(state, persona)
     await message.reply("Характер ИИ обновлён.")
 
 
 @dp.message(Command("ai_persona_show"))
 async def cmd_ai_persona_show(message: Message):
-    await message.reply(f"Текущий характер ИИ:\n\n{get_ai_persona(state)}")
+    persona = get_ai_persona(state)
+    # Защита от TelegramBadRequest "message is too long" (лимит Telegram — 4096
+    # символов), даже если в состоянии уже лежит слишком длинный текст —
+    # например, сохранённый до появления лимита в /ai_persona выше.
+    limit = 3800
+    if len(persona) > limit:
+        persona = persona[:limit] + f"…\n\n[обрезано, полная длина: {len(persona)} символов]"
+    await message.reply(f"Текущий характер ИИ:\n\n{persona}")
 
 
 AI_MUTE_COMMAND_RE = re.compile(r"/mute\s+(@\w+)\s+(\d{1,2})", re.IGNORECASE)
@@ -959,78 +986,62 @@ async def moderate(message: Message):
         await bot.send_chat_action(message.chat.id, "typing")
         answer = await ask_gemini(prompt)
         clean_answer, target_username, mute_minutes = parse_mute_command(answer)
-        await message.reply(clean_answer)
 
-        if target_username and mute_minutes and message.from_user:
-            admin_ids = await get_admin_ids(message.chat.id)
-            sender_is_admin = message.from_user.id in admin_ids
-            sender_username_norm = (sender_username or "").lower()
-            until = time.time() + mute_minutes * 60
+        # Важно: НЕ отвечаем текстом ИИ сразу. Он может написать "Сделано" ещё
+        # до того, как мы проверили права и реально что-то замьютили — тогда
+        # бот соврёт про результат. Сначала проверяем права и выполняем
+        # действие (если оно вообще запрошено и разрешено), и только потом
+        # шлём ровно один ответ, соответствующий тому, что произошло на самом деле.
+        if not (target_username and mute_minutes and message.from_user):
+            await message.reply(clean_answer)
+            return
 
-            if target_username == sender_username_norm:
-                # Самозащита: ИИ мьютит самого автора за грубость. Админа мьютить нельзя.
-                if sender_is_admin:
-                    logging.info("ИИ решила замьютить админа за грубость — игнорирую.")
-                else:
-                    name = f"@{sender_username}" if sender_username else message.from_user.full_name
-                    mute_user(state, message.chat.id, message.from_user.id, name, until=until)
-                    try:
-                        await bot.send_message(
-                            message.chat.id,
-                            f"{name} замьючен на {mute_minutes} мин. — решение ИИ-админши.",
-                            message_thread_id=message.message_thread_id,
-                        )
-                    except Exception as e:
-                        logging.warning(f"Не удалось отправить уведомление о муте от ИИ: {e}")
-            elif sender_is_admin:
-                # Явная просьба админа замьютить третьего пользователя — доверяем,
-                # т.к. message.from_user проверен самим Telegram и не подделывается.
-                try:
-                    target_id = resolve_username_to_id(state, target_username)
-                    if target_id is None:
-                        target_chat = await bot.get_chat(f"@{target_username}")
-                        target_id = target_chat.id
-                    if target_id in admin_ids:
-                        await bot.send_message(
-                            message.chat.id,
-                            f"@{target_username} — админ, мьютить нельзя.",
-                            message_thread_id=message.message_thread_id,
-                        )
-                    else:
-                        mute_user(state, message.chat.id, target_id, f"@{target_username}", until=until)
-                        await bot.send_message(
-                            message.chat.id,
-                            f"@{target_username} замьючен на {mute_minutes} мин. по просьбе "
-                            f"{message.from_user.full_name}.",
-                            message_thread_id=message.message_thread_id,
-                        )
-                except Exception as e:
-                    logging.warning(f"Не удалось замьютить @{target_username} по просьбе админа: {e}")
-                    try:
-                        await bot.send_message(
-                            message.chat.id,
-                            f"Не получилось замьютить @{target_username} — бот его ещё не знает "
-                            f"(нужно, чтобы он раньше уже писал в группе). Надёжнее: ответь (reply) "
-                            f"на его сообщение командой /mute {mute_minutes}.",
-                            message_thread_id=message.message_thread_id,
-                        )
-                    except Exception:
-                        pass
+        admin_ids = await get_admin_ids(message.chat.id)
+        sender_is_admin = message.from_user.id in admin_ids
+        sender_username_norm = (sender_username or "").lower()
+        until = time.time() + mute_minutes * 60
+
+        if target_username == sender_username_norm:
+            # Самозащита: ИИ мьютит самого автора за грубость. Админа мьютить нельзя.
+            if sender_is_admin:
+                logging.info("ИИ решила замьютить админа за грубость — игнорирую.")
+                await message.reply(clean_answer)
             else:
-                logging.warning(
-                    f"ИИ попыталась замьютить @{target_username} по просьбе не-админа "
-                    f"(@{sender_username}) — игнорирую."
+                name = f"@{sender_username}" if sender_username else message.from_user.full_name
+                mute_user(state, message.chat.id, message.from_user.id, name, until=until)
+                await message.reply(clean_answer)  # мут реально выполнен — текст ИИ соответствует правде
+        elif sender_is_admin:
+            # Явная просьба админа замьютить третьего пользователя — доверяем,
+            # т.к. message.from_user проверен самим Telegram и не подделывается.
+            try:
+                target_id = resolve_username_to_id(state, target_username)
+                if target_id is None:
+                    target_chat = await bot.get_chat(f"@{target_username}")
+                    target_id = target_chat.id
+                if target_id in admin_ids:
+                    await message.reply(f"@{target_username} — админ, мьютить нельзя.")
+                else:
+                    mute_user(state, message.chat.id, target_id, f"@{target_username}", until=until)
+                    await message.reply(clean_answer)  # мут реально выполнен — текст ИИ соответствует правде
+            except Exception as e:
+                logging.warning(f"Не удалось замьютить @{target_username} по просьбе админа: {e}")
+                await message.reply(
+                    f"Не получилось замьютить @{target_username} — бот его ещё не знает "
+                    f"(нужно, чтобы он раньше уже писал в группе). Надёжнее: ответь (reply) "
+                    f"на его сообщение командой /mute {mute_minutes}."
                 )
-                try:
-                    await bot.send_message(
-                        message.chat.id,
-                        f"@{sender_username}, у тебя не хватает авторитета, чтобы просить о таком."
-                        if sender_username else
-                        "У тебя не хватает авторитета, чтобы просить о таком.",
-                        message_thread_id=message.message_thread_id,
-                    )
-                except Exception as e:
-                    logging.warning(f"Не удалось отправить отказ не-админу: {e}")
+        else:
+            # Не-админ просит замьютить кого-то другого — отказываем и НЕ показываем
+            # текст ИИ (он мог уже написать "сделано", хотя действие запрещено).
+            logging.warning(
+                f"ИИ попыталась замьютить @{target_username} по просьбе не-админа "
+                f"(@{sender_username}) — игнорирую."
+            )
+            await message.reply(
+                f"@{sender_username}, у тебя не хватает авторитета, чтобы просить о таком."
+                if sender_username else
+                "У тебя не хватает авторитета, чтобы просить о таком."
+            )
         return
 
     if not is_moderation_enabled(state):
@@ -1099,7 +1110,8 @@ async def moderate(message: Message):
                     await bot.send_message(
                         message.chat.id,
                         f"{name} замьючен на {minutes} мин. за флуд. "
-                        f"После мута счётчик предупреждений обнулён — снова 3 попытки.",
+                        f"После мута счётчик предупреждений обнулён — снова "
+                        f"{warnings_limit} {_plural_ru(warnings_limit, 'попытка', 'попытки', 'попыток')}.",
                         message_thread_id=thread_id,
                     )
                 except Exception as e:
