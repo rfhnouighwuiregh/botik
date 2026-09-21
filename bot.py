@@ -202,6 +202,60 @@ def _not_found_reply(name: str | None) -> str:
 
 
 # ============================================================
+# ИНСТРУКЦИЯ (INSTRUCTIONS.md) — отправляется по /start в личке с ботом
+# и по команде /инструкция в любом чате. Файл может быть длиннее лимита
+# Telegram (4096 символов на сообщение), поэтому режем на части.
+# ============================================================
+INSTRUCTIONS_PATH = os.path.join(os.path.dirname(__file__), "INSTRUCTIONS.md")
+TELEGRAM_MESSAGE_LIMIT = 4096
+_INSTRUCTIONS_CHUNK_LIMIT = 3500  # с запасом от лимита Telegram
+
+
+def _load_instructions_text() -> str:
+    try:
+        with open(INSTRUCTIONS_PATH, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception as e:
+        logging.warning(f"Не удалось прочитать {INSTRUCTIONS_PATH}: {e}")
+        return "Файл с инструкцией не найден на сервере — обратись к тому, кто разворачивал бота."
+
+
+def _split_into_chunks(text: str, limit: int = _INSTRUCTIONS_CHUNK_LIMIT) -> list[str]:
+    """Режет текст на части ≤limit символов, стараясь резать по границам строк."""
+    lines = text.split("\n")
+    chunks: list[str] = []
+    current = ""
+    for line in lines:
+        while len(line) > limit:  # на случай одной аномально длинной строки
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+async def send_instructions(chat_id: int, thread_id: int | None = None) -> None:
+    chunks = _split_into_chunks(_load_instructions_text())
+    for i, chunk in enumerate(chunks):
+        try:
+            await bot.send_message(chat_id, chunk, message_thread_id=thread_id)
+        except Exception as e:
+            logging.warning(f"Не удалось отправить часть инструкции ({i + 1}/{len(chunks)}): {e}")
+            return
+        if i < len(chunks) - 1:
+            await asyncio.sleep(0.3)  # не спамить Telegram сообщениями подряд без паузы
+
+
+# ============================================================
 # ОПРЕДЕЛЕНИЕ ПОЛЬЗОВАТЕЛЯ ДЛЯ /mute И /unmute
 # ============================================================
 async def resolve_target_user(message: Message, arg: str | None):
@@ -269,6 +323,20 @@ async def on_bot_added(message: Message):
 # ============================================================
 # ГЛОБАЛЬНЫЕ КОМАНДЫ
 # ============================================================
+@dp.message(Command("start"), F.chat.type == "private")
+async def cmd_start_private(message: Message):
+    """
+    /start в личке с ботом — это не про модерацию (там нет разделов и
+    админов группы), а стандартное приветствие + инструкция. Обязательно
+    регистрируется РАНЬШЕ общего cmd_start ниже, иначе тот перехватит
+    личку и попытается проверить админку в чате, которого не существует.
+    """
+    await message.reply(
+        "Привет! Я бот-модератор для супергрупп с темами. Вот инструкция по всем командам:"
+    )
+    await send_instructions(message.chat.id)
+
+
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     if not await is_admin(message):
@@ -332,6 +400,30 @@ async def cmd_sections(message: Message):
         lines.append(f"• {sec['name']} (id={tid}) — {status}, {rule}")
 
     await message.reply("\n".join(lines))
+
+
+# ============================================================
+# ИНСТРУКЦИЯ ПО КОМАНДЕ (работает в любом чате: группа/тема/личка)
+# Не через aiogram Command(), а через ручной фильтр по первому слову:
+# Telegram НЕ генерирует entity "bot_command" для кириллических команд
+# (только для [A-Za-z0-9_]), поэтому "/инструкция" не поймать через
+# стандартный Command() — он молча не сработает.
+# ============================================================
+_INSTRUCTIONS_TRIGGERS = {"/инструкция", "/инструкции", "/instructions", "/help", "/помощь"}
+
+
+def _is_instructions_trigger(message: Message) -> bool:
+    if not message.text:
+        return False
+    first_word = message.text.strip().split()[0]
+    first_word = first_word.split("@")[0].lower()  # убираем /команда@botusername, если есть
+    return first_word in _INSTRUCTIONS_TRIGGERS
+
+
+@dp.message(_is_instructions_trigger)
+async def cmd_instructions(message: Message):
+    thread_id = message.message_thread_id if message.chat.type != "private" else None
+    await send_instructions(message.chat.id, thread_id)
 
 
 # ============================================================
@@ -989,7 +1081,26 @@ AI_MUTE_PROTOCOL = (
     "(без числа минут). Если размучивать не хочешь — просто не пиши эту строку.\n\n"
     "Обе команды взаимоисключающие — в одном ответе пиши не больше одной строки-команды. "
     "Формат обязателен именно такой, эту строку вырежут из текста перед отправкой, "
-    "пользователь её не увидит."
+    "пользователь её не увидит.\n\n"
+    "Кроме мьюта и размута, по ЯВНОЙ просьбе админа (только админа, не любого участника) ты "
+    "можешь выполнить и другие команды бота — вот полный список с форматом аргументов:\n"
+    "/allow <тип> [раздел] — разрешить тип контента (photo, video, gif, text, link, sticker, "
+    "voice, document, dice) в разделе; если раздел не назвали — берётся тот, где идёт разговор\n"
+    "/deny <тип> [раздел] — запретить тип контента, формат такой же\n"
+    "/section_on [раздел] — включить модерацию в разделе\n"
+    "/section_off [раздел] — выключить модерацию в разделе\n"
+    "/blacklist_add <слово> — добавить слово в чёрный список (сообщения с ним будут удаляться)\n"
+    "/blacklist_remove <слово> — убрать слово из чёрного списка\n"
+    "/flood_on — включить антифлуд\n"
+    "/flood_off — выключить антифлуд\n"
+    "/start — включить модерацию во всей группе целиком\n"
+    "/stop — выключить модерацию во всей группе целиком\n"
+    "Если решила выполнить одну из этих команд — напиши её на отдельной строке в конце ответа, "
+    "в точности как показано выше (со слэшем). Не путай /start и /stop с мьютом — это разные "
+    "действия. Если сомневаешься, что именно просит админ, лучше уточни вопросом, а не гадай. "
+    "За один ответ можно написать только ОДНУ команду суммарно (мьют, размут ИЛИ одну из этих — "
+    "не несколько сразу). Если автор сообщения не админ — эти команды не сработают, поэтому "
+    "не пиши их по просьбе обычного участника, а объясни, что нужны права админа."
 )
 
 
@@ -1018,6 +1129,120 @@ def parse_unmute_command(text: str) -> tuple:
     clean_text = AI_UNMUTE_COMMAND_RE.sub("", text).strip()
     target_username = match.group(1).lstrip("@").lower()
     return clean_text, target_username
+
+
+# ============================================================
+# ОБЩИЕ ИИ-КОМАНДЫ (кроме мьюта/размута) — только по явной просьбе
+# админа, работают в контексте текущего раздела (если не указан другой).
+# Каждая функция либо тихо выполняет действие, либо кидает ValueError
+# с понятным текстом, который увидит админ (Gemini этот текст не пишет
+# сама — мы формируем его сами, чтобы не полагаться на честность модели
+# при ошибке).
+# ============================================================
+async def _ai_action_allow(message: Message, args: str) -> None:
+    parts = args.split(maxsplit=1)
+    if not parts:
+        raise ValueError("не указан тип контента, например /allow photo")
+    content_type = parts[0].lower()
+    if content_type not in CONTENT_TYPES:
+        raise ValueError(f"неизвестный тип контента «{content_type}». Варианты: {', '.join(CONTENT_TYPES)}")
+    section_name = parts[1].strip() if len(parts) > 1 else None
+    thread_id, section = resolve_section(message, section_name)
+    if not section:
+        raise ValueError(_not_found_reply(section_name))
+    allow_type(state, thread_id, content_type)
+
+
+async def _ai_action_deny(message: Message, args: str) -> None:
+    parts = args.split(maxsplit=1)
+    if not parts:
+        raise ValueError("не указан тип контента, например /deny photo")
+    content_type = parts[0].lower()
+    if content_type not in CONTENT_TYPES:
+        raise ValueError(f"неизвестный тип контента «{content_type}». Варианты: {', '.join(CONTENT_TYPES)}")
+    section_name = parts[1].strip() if len(parts) > 1 else None
+    thread_id, section = resolve_section(message, section_name)
+    if not section:
+        raise ValueError(_not_found_reply(section_name))
+    deny_type(state, thread_id, content_type)
+
+
+async def _ai_action_section_on(message: Message, args: str) -> None:
+    thread_id, section = resolve_section(message, args.strip() or None)
+    if not section:
+        raise ValueError(_not_found_reply(args.strip() or None))
+    set_section_enabled(state, thread_id, True)
+
+
+async def _ai_action_section_off(message: Message, args: str) -> None:
+    thread_id, section = resolve_section(message, args.strip() or None)
+    if not section:
+        raise ValueError(_not_found_reply(args.strip() or None))
+    set_section_enabled(state, thread_id, False)
+
+
+async def _ai_action_blacklist_add(message: Message, args: str) -> None:
+    word = args.strip()
+    if not word:
+        raise ValueError("не указано слово, например /blacklist_add спам")
+    if not add_blacklist_word(state, word):
+        raise ValueError(f"слово «{word}» и так уже в чёрном списке")
+
+
+async def _ai_action_blacklist_remove(message: Message, args: str) -> None:
+    word = args.strip()
+    if not word:
+        raise ValueError("не указано слово")
+    if not remove_blacklist_word(state, word):
+        raise ValueError(f"слова «{word}» и так нет в чёрном списке")
+
+
+async def _ai_action_flood_on(message: Message, args: str) -> None:
+    set_flood_enabled(state, True)
+
+
+async def _ai_action_flood_off(message: Message, args: str) -> None:
+    set_flood_enabled(state, False)
+
+
+async def _ai_action_moderation_on(message: Message, args: str) -> None:
+    set_moderation_enabled(state, True)
+
+
+async def _ai_action_moderation_off(message: Message, args: str) -> None:
+    set_moderation_enabled(state, False)
+
+
+# Имя команды (как в /команда) -> функция-исполнитель. Расширяется просто
+# добавлением новой пары сюда — не нужно трогать разбор/протокол ниже.
+AI_ACTIONS = {
+    "allow": _ai_action_allow,
+    "deny": _ai_action_deny,
+    "section_on": _ai_action_section_on,
+    "section_off": _ai_action_section_off,
+    "blacklist_add": _ai_action_blacklist_add,
+    "blacklist_remove": _ai_action_blacklist_remove,
+    "flood_on": _ai_action_flood_on,
+    "flood_off": _ai_action_flood_off,
+    "start": _ai_action_moderation_on,
+    "stop": _ai_action_moderation_off,
+}
+
+AI_ACTION_COMMAND_RE = re.compile(
+    r"/(" + "|".join(re.escape(name) for name in AI_ACTIONS) + r")(?:\s+([^\n]*))?",
+    re.IGNORECASE,
+)
+
+
+def parse_ai_action(text: str) -> tuple:
+    """Ищет строку вида '/действие аргументы' из набора AI_ACTIONS. Аналог parse_mute_command."""
+    match = AI_ACTION_COMMAND_RE.search(text)
+    if not match:
+        return text.strip(), None, None
+    clean_text = AI_ACTION_COMMAND_RE.sub("", text).strip()
+    action_name = match.group(1).lower()
+    args = (match.group(2) or "").strip()
+    return clean_text, action_name, args
 
 
 async def ask_gemini(prompt: str) -> str:
@@ -1122,13 +1347,16 @@ async def moderate(message: Message):
         unmute_target = None
         if target_username is None:
             clean_answer, unmute_target = parse_unmute_command(clean_answer)
+        action_name, action_args = None, None
+        if target_username is None and unmute_target is None:
+            clean_answer, action_name, action_args = parse_ai_action(clean_answer)
 
         # Важно: НЕ отвечаем текстом ИИ сразу. Он может написать "Сделано" ещё
         # до того, как мы проверили права и реально что-то сделали — тогда
         # бот соврёт про результат. Сначала проверяем права и выполняем
         # действие (если оно вообще запрошено и разрешено), и только потом
         # шлём ровно один ответ, соответствующий тому, что произошло на самом деле.
-        if not message.from_user or not (target_username and mute_minutes or unmute_target):
+        if not message.from_user or not (target_username and mute_minutes or unmute_target or action_name):
             await message.reply(clean_answer)
         else:
             admin_ids = await get_admin_ids(message.chat.id)
@@ -1187,8 +1415,7 @@ async def moderate(message: Message):
                         if sender_username else
                         "У тебя не хватает авторитета, чтобы просить о таком."
                     )
-            else:
-                # unmute_target задан (ветка мьюта выше не подошла)
+            elif unmute_target:
                 if unmute_target == sender_username_norm and not sender_is_admin:
                     # Прощение по усмотрению ИИ — но только реально замьюченного, а не любого желающего.
                     if is_user_muted(state, message.chat.id, message.from_user.id):
@@ -1232,6 +1459,28 @@ async def moderate(message: Message):
                         if sender_username else
                         "У тебя не хватает авторитета, чтобы просить о таком."
                     )
+            elif action_name:
+                if not sender_is_admin:
+                    # Только админ может просить бота выполнить прочие команды —
+                    # ИИ не должна ничего менять по просьбе рядового участника.
+                    logging.warning(
+                        f"ИИ попыталась выполнить /{action_name} по просьбе не-админа "
+                        f"(@{sender_username}) — игнорирую."
+                    )
+                    await message.reply(
+                        f"@{sender_username}, у тебя не хватает авторитета, чтобы просить о таком."
+                        if sender_username else
+                        "У тебя не хватает авторитета, чтобы просить о таком."
+                    )
+                else:
+                    try:
+                        await AI_ACTIONS[action_name](message, action_args)
+                        await message.reply(clean_answer)  # действие реально выполнено — текст ИИ соответствует правде
+                    except ValueError as e:
+                        await message.reply(f"Не получилось: {e}")
+                    except Exception as e:
+                        logging.warning(f"Ошибка при выполнении ИИ-команды /{action_name}: {e}")
+                        await message.reply("Не получилось выполнить это действие, попробуй явной командой.")
 
         # Мьют здесь реализован не через права Telegram, а через удаление
         # сообщений замьюченных в остальном коде — значит, упоминание бота
