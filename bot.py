@@ -202,6 +202,65 @@ def _not_found_reply(name: str | None) -> str:
 
 
 # ============================================================
+# РЕАЛЬНЫЕ НАСТРОЙКИ РАЗДЕЛА ДЛЯ ИИ (чтобы не выдумывала на вопрос
+# "какие настройки у раздела X", а отвечала по факту, как /status)
+# ============================================================
+def _format_section_status_line(section: dict) -> str:
+    if section.get("admin_only"):
+        return "режим «только админ» (ультра) — писать может только админ, всем остальным запрещено всё"
+    allowed = section.get("allowed_types", [])
+    if not allowed:
+        return "ничего не разрешено — любое сообщение будет удалено"
+    line = f"разрешённые типы контента: {', '.join(allowed)}"
+    if "dice" in allowed and section.get("allowed_dice_emojis"):
+        line += f"; разрешённые dice-эмодзи: {', '.join(section['allowed_dice_emojis'])}"
+    return line
+
+
+_SECTION_QUESTION_KEYWORDS = (
+    "настрой", "раздел", "правил", "что можно", "что нельзя", "allow", "тип контента", "статус",
+)
+
+
+def build_section_status_note(message: Message, question: str) -> str:
+    """
+    Если вопрос похож на просьбу рассказать о настройках/правилах раздела —
+    подмешиваем в промпт РЕАЛЬНЫЕ данные из state (как в /status), чтобы ИИ
+    отвечала по факту, а не общими фразами вроде "всё стандартно". Триггер по
+    ключевым словам не идеален, но и не страшно сработать лишний раз — если
+    вопрос был не про настройки, ИИ просто не станет использовать этот блок.
+    """
+    q_lower = question.lower()
+    if not any(k in q_lower for k in _SECTION_QUESTION_KEYWORDS):
+        return ""
+
+    # Сначала ищем явно названный раздел по имени прямо в тексте вопроса,
+    # если не нашли — берём раздел текущей темы, где идёт разговор.
+    target_name, target_section = None, None
+    for tid, sec in state["sections"].items():
+        if sec["name"].strip().lower() in q_lower:
+            target_name, target_section = sec["name"], sec
+            break
+    if target_section is None:
+        target_section = get_section(state, message.message_thread_id)
+        target_name = target_section["name"] if target_section else None
+
+    if target_section is None:
+        return (
+            "\n\n[В этой теме нет зарегистрированного раздела модерации — так и скажи, "
+            "не придумывай настройки, которых не существует.]"
+        )
+
+    status_line = "включён" if target_section.get("enabled", True) else "выключен"
+    rules_line = _format_section_status_line(target_section)
+    return (
+        f"\n\n[Реальные текущие настройки раздела «{target_name}»: раздел {status_line}; "
+        f"{rules_line}. Отвечая про настройки — используй строго эти данные, "
+        f"ничего не выдумывай и не отвечай общими фразами вроде «всё стандартно».]"
+    )
+
+
+# ============================================================
 # ИНСТРУКЦИЯ (INSTRUCTIONS.md) — отправляется по /start в личке с ботом
 # и по команде /инструкция в любом чате. Файл может быть длиннее лимита
 # Telegram (4096 символов на сообщение), поэтому режем на части.
@@ -1335,10 +1394,12 @@ async def moderate(message: Message):
                     f"используй их, если он просит амнистию:\n{history_text}]"
                 )
 
+        section_note = build_section_status_note(message, question)
+
         prompt = (
-            f"[от @{sender_username}]: {question}{quoted_note}{history_note}"
+            f"[от @{sender_username}]: {question}{quoted_note}{history_note}{section_note}"
             if sender_username else
-            f"{question}{quoted_note}{history_note}"
+            f"{question}{quoted_note}{history_note}{section_note}"
         )
 
         await bot.send_chat_action(message.chat.id, "typing")
