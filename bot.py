@@ -29,6 +29,7 @@ from state import (
     mute_user,
     unmute_user,
     is_user_muted,
+    get_mute_source,
     get_blacklist,
     add_blacklist_word,
     remove_blacklist_word,
@@ -48,6 +49,9 @@ from state import (
     delete_preset,
     get_ai_persona,
     set_ai_persona,
+    record_violation,
+    get_violations,
+    reset_violations,
     remember_user,
     resolve_username_to_id,
     log_user_message,
@@ -388,6 +392,53 @@ async def cmd_preset_delete(message: Message, command: CommandObject):
         await message.reply(f"Пресета '{name}' не было.")
 
 
+@dp.message(Command("violators"))
+async def cmd_violators(message: Message, command: CommandObject):
+    """
+    Таблица нарушителей. Без аргумента — постит в текущую тему.
+    С аргументом — постит в раздел с этим названием (должен быть
+    зарегистрирован через /register, как и у остальных команд с [раздел]).
+    """
+    name = command.args.strip() if command.args else None
+    if name:
+        target_thread_id, section = resolve_section(message, name)
+        if section is None:
+            await message.reply(_not_found_reply(name))
+            return
+    else:
+        target_thread_id = message.message_thread_id
+
+    violations = get_violations(state, message.chat.id)
+    lines = ["ТАБЕЛЬ ОБСИРАЕМОСТИ!", ""]
+    if not violations:
+        lines.append("Пока никто не нарушал — тишина и благодать.")
+    else:
+        ranked = sorted(violations.items(), key=lambda kv: kv[1]["count"], reverse=True)[:20]
+        for i, (uid, info) in enumerate(ranked, start=1):
+            lines.append(f"{i}. {info['name']} — {info['count']} ({info.get('last_reason', '')})")
+
+    try:
+        await bot.send_message(message.chat.id, "\n".join(lines), message_thread_id=target_thread_id)
+    except Exception as e:
+        logging.warning(f"Не удалось отправить табель нарушителей: {e}")
+        await message.reply("Не получилось отправить табель — проверь, что раздел существует и бот может туда писать.")
+
+
+@dp.message(Command("violators_reset"))
+async def cmd_violators_reset(message: Message, command: CommandObject):
+    if not await is_admin(message):
+        await message.reply("Только админ может это делать.")
+        return
+    user_id = None
+    if command.args:
+        user_id, _ = await resolve_target_user(message, command.args)
+        if user_id is None:
+            await message.reply("Не понял, кому сбросить счёт. Ответь (reply) на его сообщение или укажи @username / id.")
+            return
+    reset_violations(state, message.chat.id, user_id)
+    await message.reply("Счёт сброшен." if user_id else "Табель полностью обнулён.")
+
+
 @dp.message(Command("types"))
 async def cmd_types(message: Message):
     await message.reply(
@@ -633,7 +684,8 @@ async def cmd_mute(message: Message, command: CommandObject):
         return
 
     until = time.time() + duration_minutes * 60 if duration_minutes else None
-    mute_user(state, message.chat.id, user_id, name, until=until)
+    mute_user(state, message.chat.id, user_id, name, until=until, source="admin")
+    record_violation(state, message.chat.id, user_id, name, "замьючен вручную админом")
     if duration_minutes:
         await message.reply(f"{name} замьючен на {duration_minutes} мин.")
     else:
@@ -669,14 +721,16 @@ async def cmd_muted(message: Message):
     if not muted:
         await message.reply("Никто не замьючен.")
         return
+    source_labels = {"admin": "от админа", "flood": "флуд", "ai": "решение ИИ"}
     lines = []
     for uid, info in muted.items():
         until = info.get("until")
+        label = source_labels.get(info.get("source", "admin"), "от админа")
         if until:
             minutes_left = max(0, int((until - time.time()) / 60))
-            lines.append(f"• {info['name']} (id={uid}) — флуд, ещё ~{minutes_left} мин.")
+            lines.append(f"• {info['name']} (id={uid}) — {label}, ещё ~{minutes_left} мин.")
         else:
-            lines.append(f"• {info['name']} (id={uid}) — бессрочно")
+            lines.append(f"• {info['name']} (id={uid}) — {label}, бессрочно")
     await message.reply("Замьюченные пользователи:\n" + "\n".join(lines))
 
 
@@ -1053,17 +1107,25 @@ async def moderate(message: Message):
             if target_username and mute_minutes:
                 until = time.time() + mute_minutes * 60
                 if target_username == sender_username_norm:
-                    # Самозащита: ИИ мьютит самого автора за грубость. Админа мьютить нельзя.
+                    # Самозащита: ИИ мьютит самого автора за грубость. Админа мьютить нельзя —
+                    # и говорим об этом прямо, а не полагаемся на то, что напишет сама модель.
                     if sender_is_admin:
                         logging.info("ИИ решила замьютить админа за грубость — игнорирую.")
-                        await message.reply(clean_answer)
+                        await message.reply(
+                            f"@{sender_username}, у тебя админка — мьютить тебя я не могу."
+                            if sender_username else
+                            "У тебя админка — мьютить тебя я не могу."
+                        )
                     else:
                         name = f"@{sender_username}" if sender_username else message.from_user.full_name
-                        mute_user(state, message.chat.id, message.from_user.id, name, until=until)
+                        mute_user(state, message.chat.id, message.from_user.id, name, until=until, source="ai")
+                        record_violation(state, message.chat.id, message.from_user.id, name, "грубость в адрес ИИ")
                         await message.reply(clean_answer)  # мут реально выполнен — текст ИИ соответствует правде
                 elif sender_is_admin:
                     # Явная просьба админа замьютить третьего пользователя — доверяем,
                     # т.к. message.from_user проверен самим Telegram и не подделывается.
+                    # source="admin" (не "ai") — это решение живого админа, просто исполненное
+                    # через ИИ, поэтому амнистия извинениями на такой мьют потом не действует.
                     try:
                         target_id = resolve_username_to_id(state, target_username)
                         if target_id is None:
@@ -1072,7 +1134,8 @@ async def moderate(message: Message):
                         if target_id in admin_ids:
                             await message.reply(f"@{target_username} — админ, мьютить нельзя.")
                         else:
-                            mute_user(state, message.chat.id, target_id, f"@{target_username}", until=until)
+                            mute_user(state, message.chat.id, target_id, f"@{target_username}", until=until, source="admin")
+                            record_violation(state, message.chat.id, target_id, f"@{target_username}", "замьючен по просьбе админа")
                             await message.reply(clean_answer)  # мут реально выполнен — текст ИИ соответствует правде
                     except Exception as e:
                         logging.warning(f"Не удалось замьютить @{target_username} по просьбе админа: {e}")
@@ -1098,8 +1161,16 @@ async def moderate(message: Message):
                 if unmute_target == sender_username_norm and not sender_is_admin:
                     # Прощение по усмотрению ИИ — но только реально замьюченного, а не любого желающего.
                     if is_user_muted(state, message.chat.id, message.from_user.id):
-                        unmute_user(state, message.chat.id, message.from_user.id)
-                        await message.reply(clean_answer)  # размут реально выполнен — текст ИИ соответствует правде
+                        if get_mute_source(state, message.chat.id, message.from_user.id) == "admin":
+                            # Мьют выдал живой админ — ИИ не вправе отменять это решение
+                            # извинениями, каким бы искренним ни было раскаяние.
+                            await message.reply(
+                                "Этот мут выдал админ лично — извинения тут не принимаются, "
+                                "снять его может только он сам."
+                            )
+                        else:
+                            unmute_user(state, message.chat.id, message.from_user.id)
+                            await message.reply(clean_answer)  # размут реально выполнен — текст ИИ соответствует правде
                     else:
                         await message.reply("Ты и так не в муте.")
                 elif sender_is_admin:
@@ -1159,6 +1230,9 @@ async def moderate(message: Message):
     text_to_check = message.text or message.caption
     bad_word = find_blacklisted_word(state, text_to_check)
     if bad_word:
+        if message.from_user:
+            viol_name = f"@{message.from_user.username}" if message.from_user.username else message.from_user.full_name
+            record_violation(state, message.chat.id, message.from_user.id, viol_name, f"запрещённое слово «{bad_word}»")
         try:
             await message.delete()
         except Exception as e:
@@ -1184,6 +1258,7 @@ async def moderate(message: Message):
             name = f"@{message.from_user.username}" if message.from_user.username else message.from_user.full_name
             warn_count = increment_flood_warning(state, message.chat.id, message.from_user.id)
             warnings_limit = get_flood_warnings_before_mute(state)
+            record_violation(state, message.chat.id, message.from_user.id, name, "флуд")
 
             try:
                 await message.delete()
@@ -1203,7 +1278,7 @@ async def moderate(message: Message):
             else:
                 minutes = get_flood_mute_minutes(state)
                 until = time.time() + minutes * 60
-                mute_user(state, message.chat.id, message.from_user.id, name, until=until)
+                mute_user(state, message.chat.id, message.from_user.id, name, until=until, source="flood")
                 reset_flood_warning(state, message.chat.id, message.from_user.id)
                 try:
                     await bot.send_message(
@@ -1226,6 +1301,8 @@ async def moderate(message: Message):
         admin_ids = await get_admin_ids(message.chat.id)
         if message.from_user.id in admin_ids:
             return  # админу можно всё
+        viol_name = f"@{message.from_user.username}" if message.from_user.username else message.from_user.full_name
+        record_violation(state, message.chat.id, message.from_user.id, viol_name, f"писал в разделе '{section['name']}' (только админ)")
         try:
             await message.delete()
         except Exception as e:
@@ -1238,6 +1315,9 @@ async def moderate(message: Message):
             f"Удаляю сообщение в разделе '{section['name']}': "
             f"обнаружено={detected}, разрешено={section.get('allowed_types')}"
         )
+        if message.from_user:
+            viol_name = f"@{message.from_user.username}" if message.from_user.username else message.from_user.full_name
+            record_violation(state, message.chat.id, message.from_user.id, viol_name, f"запрещённый тип контента в '{section['name']}'")
         try:
             await message.delete()
         except Exception as e:
