@@ -109,15 +109,26 @@ def set_moderation_enabled(state: dict, value: bool) -> None:
 
 
 # ---------------- разделы ----------------
+# Хранятся вложенно: state["sections"][chat_id][thread_id] = {...}.
+# Обязательно через chat_id — Telegram нумерует темы (thread_id) независимо
+# в каждой супергруппе, так что одинаковый thread_id в двух разных чатах
+# не означает один и тот же раздел. Без chat_id бот бы путал разделы
+# между разными группами, если его добавить больше чем в одну.
 
-def get_section(state: dict, thread_id) -> dict | None:
+def get_chat_sections(state: dict, chat_id: int) -> dict:
+    """Все зарегистрированные разделы ИМЕННО этого чата: {thread_id: {...}}."""
+    return state.setdefault("sections", {}).get(str(chat_id), {})
+
+
+def get_section(state: dict, chat_id: int, thread_id) -> dict | None:
     if thread_id is None:
         return None
-    return state["sections"].get(str(thread_id))
+    return get_chat_sections(state, chat_id).get(str(thread_id))
 
 
-def register_section(state: dict, thread_id: int, name: str) -> None:
-    state["sections"][str(thread_id)] = {
+def register_section(state: dict, chat_id: int, thread_id: int, name: str) -> None:
+    chat_sections = state.setdefault("sections", {}).setdefault(str(chat_id), {})
+    chat_sections[str(thread_id)] = {
         "name": name,
         "enabled": True,
         "admin_only": False,
@@ -127,41 +138,41 @@ def register_section(state: dict, thread_id: int, name: str) -> None:
     save_state(state)
 
 
-def unregister_section(state: dict, thread_id: int) -> None:
-    state["sections"].pop(str(thread_id), None)
+def unregister_section(state: dict, chat_id: int, thread_id: int) -> None:
+    state.setdefault("sections", {}).setdefault(str(chat_id), {}).pop(str(thread_id), None)
     save_state(state)
 
 
-def set_section_enabled(state: dict, thread_id: int, value: bool) -> None:
-    section = get_section(state, thread_id)
+def set_section_enabled(state: dict, chat_id: int, thread_id: int, value: bool) -> None:
+    section = get_section(state, chat_id, thread_id)
     if section:
         section["enabled"] = value
         save_state(state)
 
 
-def set_admin_only(state: dict, thread_id: int, value: bool) -> None:
-    section = get_section(state, thread_id)
+def set_admin_only(state: dict, chat_id: int, thread_id: int, value: bool) -> None:
+    section = get_section(state, chat_id, thread_id)
     if section:
         section["admin_only"] = value
         save_state(state)
 
 
-def allow_type(state: dict, thread_id: int, content_type: str) -> None:
-    section = get_section(state, thread_id)
+def allow_type(state: dict, chat_id: int, thread_id: int, content_type: str) -> None:
+    section = get_section(state, chat_id, thread_id)
     if section and content_type not in section["allowed_types"]:
         section["allowed_types"].append(content_type)
         save_state(state)
 
 
-def deny_type(state: dict, thread_id: int, content_type: str) -> None:
-    section = get_section(state, thread_id)
+def deny_type(state: dict, chat_id: int, thread_id: int, content_type: str) -> None:
+    section = get_section(state, chat_id, thread_id)
     if section and content_type in section["allowed_types"]:
         section["allowed_types"].remove(content_type)
         save_state(state)
 
 
-def allow_dice_emoji(state: dict, thread_id: int, emoji: str) -> None:
-    section = get_section(state, thread_id)
+def allow_dice_emoji(state: dict, chat_id: int, thread_id: int, emoji: str) -> None:
+    section = get_section(state, chat_id, thread_id)
     if section:
         if "dice" not in section["allowed_types"]:
             section["allowed_types"].append("dice")
@@ -170,8 +181,8 @@ def allow_dice_emoji(state: dict, thread_id: int, emoji: str) -> None:
         save_state(state)
 
 
-def deny_dice_emoji(state: dict, thread_id: int, emoji: str) -> None:
-    section = get_section(state, thread_id)
+def deny_dice_emoji(state: dict, chat_id: int, thread_id: int, emoji: str) -> None:
+    section = get_section(state, chat_id, thread_id)
     if section and emoji in section.get("allowed_dice_emojis", []):
         section["allowed_dice_emojis"].remove(emoji)
         save_state(state)
@@ -374,38 +385,38 @@ def reset_flood_warning(state: dict, chat_id: int, user_id: int) -> None:
 # и включена ли модерация. Хранится в том же Redis-состоянии — переживает
 # рестарты сервиса точно так же, как и текущие настройки.
 
-def save_preset(state: dict, name: str) -> None:
-    """Сохраняет ТЕКУЩИЕ настройки под именем name (перезаписывает, если уже было)."""
+def save_preset(state: dict, chat_id: int, name: str) -> None:
+    """Сохраняет ТЕКУЩИЕ настройки этого чата под именем name (перезаписывает, если уже было)."""
     snapshot = {
         "moderation_enabled": state.get("moderation_enabled", False),
-        "sections": json.loads(json.dumps(state.get("sections", {}))),
+        "sections": json.loads(json.dumps(get_chat_sections(state, chat_id))),
         "blacklist": json.loads(json.dumps(state.get("blacklist", []))),
         "flood": json.loads(json.dumps(state.get("flood", {}))),
     }
-    state.setdefault("presets", {})[name] = snapshot
+    state.setdefault("presets", {}).setdefault(str(chat_id), {})[name] = snapshot
     save_state(state)
 
 
-def load_preset(state: dict, name: str) -> bool:
-    """Применяет сохранённый пресет как текущие настройки. False, если пресета нет."""
-    presets = state.get("presets", {})
+def load_preset(state: dict, chat_id: int, name: str) -> bool:
+    """Применяет сохранённый пресет к ЭТОМУ чату. False, если пресета нет."""
+    presets = state.get("presets", {}).get(str(chat_id), {})
     if name not in presets:
         return False
     snapshot = presets[name]
     state["moderation_enabled"] = snapshot.get("moderation_enabled", False)
-    state["sections"] = json.loads(json.dumps(snapshot.get("sections", {})))
+    state.setdefault("sections", {})[str(chat_id)] = json.loads(json.dumps(snapshot.get("sections", {})))
     state["blacklist"] = json.loads(json.dumps(snapshot.get("blacklist", [])))
     state["flood"] = json.loads(json.dumps(snapshot.get("flood", {})))
     save_state(state)
     return True
 
 
-def list_presets(state: dict) -> list:
-    return list(state.get("presets", {}).keys())
+def list_presets(state: dict, chat_id: int) -> list:
+    return list(state.get("presets", {}).get(str(chat_id), {}).keys())
 
 
-def delete_preset(state: dict, name: str) -> bool:
-    presets = state.get("presets", {})
+def delete_preset(state: dict, chat_id: int, name: str) -> bool:
+    presets = state.get("presets", {}).get(str(chat_id), {})
     if name in presets:
         del presets[name]
         save_state(state)

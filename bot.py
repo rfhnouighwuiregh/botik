@@ -17,6 +17,7 @@ from state import (
     is_moderation_enabled,
     set_moderation_enabled,
     get_section,
+    get_chat_sections,
     register_section,
     unregister_section,
     set_section_enabled,
@@ -171,10 +172,10 @@ def _is_repeated_mention(chat_id: int, user_id: int, message: Message) -> bool:
 # ПОИСК РАЗДЕЛА ПО ИМЕНИ (чтобы управлять из любой другой темы,
 # например из отдельной служебной темы "Модерация")
 # ============================================================
-def find_section_by_name(name: str):
-    """Возвращает (thread_id, section) по названию раздела, без учёта регистра."""
+def find_section_by_name(chat_id: int, name: str):
+    """Возвращает (thread_id, section) по названию раздела В ЭТОМ ЧАТЕ, без учёта регистра."""
     name_lower = name.strip().lower()
-    for tid, sec in state["sections"].items():
+    for tid, sec in get_chat_sections(state, chat_id).items():
         if sec["name"].strip().lower() == name_lower:
             return tid, sec
     return None, None
@@ -182,14 +183,14 @@ def find_section_by_name(name: str):
 
 def resolve_section(message: Message, name: str | None):
     """
-    Если name передан — ищем раздел по имени (можно управлять из любой темы).
+    Если name передан — ищем раздел по имени в ЭТОМ чате (можно управлять из любой темы).
     Если name пустой — берём раздел текущей темы, где написана команда.
     Возвращает (thread_id, section) или (None, None), если не найден.
     """
     if name:
-        return find_section_by_name(name)
+        return find_section_by_name(message.chat.id, name)
     thread_id = message.message_thread_id
-    return thread_id, get_section(state, thread_id)
+    return thread_id, get_section(state, message.chat.id, thread_id)
 
 
 def _not_found_reply(name: str | None) -> str:
@@ -220,29 +221,49 @@ def _format_section_status_line(section: dict) -> str:
 _SECTION_QUESTION_KEYWORDS = (
     "настрой", "раздел", "правил", "что можно", "что нельзя", "allow", "тип контента", "статус",
 )
+_SECTION_LIST_KEYWORDS = (
+    "перечисли", "все раздел", "список раздел", "какие раздел", "сколько раздел",
+)
 
 
 def build_section_status_note(message: Message, question: str) -> str:
     """
     Если вопрос похож на просьбу рассказать о настройках/правилах раздела —
     подмешиваем в промпт РЕАЛЬНЫЕ данные из state (как в /status), чтобы ИИ
-    отвечала по факту, а не общими фразами вроде "всё стандартно". Триггер по
-    ключевым словам не идеален, но и не страшно сработать лишний раз — если
-    вопрос был не про настройки, ИИ просто не станет использовать этот блок.
+    отвечала по факту, а не общими фразами или выдумкой. Всё строго в
+    границах ТЕКУЩЕГО чата (message.chat.id) — про разделы других чатов,
+    в которые бот тоже мог быть добавлен, ИИ ничего не знает и не должна.
     """
     q_lower = question.lower()
+    chat_sections = get_chat_sections(state, message.chat.id)
+
+    # Вопрос вида "какие вообще есть разделы" / "перечисли разделы" —
+    # отдаём список ВСЕХ разделов этого чата, а не одного.
+    if any(k in q_lower for k in _SECTION_LIST_KEYWORDS):
+        if not chat_sections:
+            return "\n\n[В этом чате пока не зарегистрировано ни одного раздела модерации — так и скажи, не выдумывай названия.]"
+        lines = []
+        for sec in chat_sections.values():
+            status_line = "включён" if sec.get("enabled", True) else "выключен"
+            lines.append(f"- «{sec['name']}»: {status_line}; {_format_section_status_line(sec)}")
+        return (
+            "\n\n[Реальный список ВСЕХ зарегистрированных разделов этого чата:\n"
+            + "\n".join(lines)
+            + "\nОтвечая, используй строго этот список, ничего не добавляй от себя и не пропускай.]"
+        )
+
     if not any(k in q_lower for k in _SECTION_QUESTION_KEYWORDS):
         return ""
 
     # Сначала ищем явно названный раздел по имени прямо в тексте вопроса,
     # если не нашли — берём раздел текущей темы, где идёт разговор.
     target_name, target_section = None, None
-    for tid, sec in state["sections"].items():
+    for sec in chat_sections.values():
         if sec["name"].strip().lower() in q_lower:
             target_name, target_section = sec["name"], sec
             break
     if target_section is None:
-        target_section = get_section(state, message.message_thread_id)
+        target_section = get_section(state, message.chat.id, message.message_thread_id)
         target_name = target_section["name"] if target_section else None
 
     if target_section is None:
@@ -435,7 +456,7 @@ async def cmd_status(message: Message, command: CommandObject):
             f"{mode_line}"
         )
     else:
-        count = len(state["sections"])
+        count = len(get_chat_sections(state, message.chat.id))
         await message.reply(
             f"Глобально: {global_status}\n"
             f"Зарегистрированных разделов: {count}\n"
@@ -445,12 +466,13 @@ async def cmd_status(message: Message, command: CommandObject):
 
 @dp.message(Command("sections"))
 async def cmd_sections(message: Message):
-    if not state["sections"]:
+    chat_sections = get_chat_sections(state, message.chat.id)
+    if not chat_sections:
         await message.reply("Ни один раздел ещё не зарегистрирован. Используй /register внутри нужной темы.")
         return
 
     lines = []
-    for tid, sec in state["sections"].items():
+    for tid, sec in chat_sections.items():
         status = "вкл" if sec["enabled"] else "выкл"
         if sec["admin_only"]:
             rule = "только админ"
@@ -497,7 +519,7 @@ async def cmd_preset_save(message: Message, command: CommandObject):
         await message.reply("Формат: /preset_save <название>\nНапример: /preset_save вечеринка")
         return
     name = command.args.strip()
-    save_preset(state, name)
+    save_preset(state, message.chat.id, name)
     await message.reply(
         f"Пресет '{name}' сохранён: текущие разделы, чёрный список, антифлуд и статус модерации.\n"
         f"Применить позже: /preset_load {name}"
@@ -513,7 +535,7 @@ async def cmd_preset_load(message: Message, command: CommandObject):
         await message.reply("Формат: /preset_load <название>\nСписок сохранённых: /presets")
         return
     name = command.args.strip()
-    if load_preset(state, name):
+    if load_preset(state, message.chat.id, name):
         await message.reply(f"Пресет '{name}' применён — разделы, чёрный список и антифлуд заменены на сохранённые.")
     else:
         await message.reply(f"Пресета '{name}' нет. Список сохранённых: /presets")
@@ -521,7 +543,7 @@ async def cmd_preset_load(message: Message, command: CommandObject):
 
 @dp.message(Command("presets"))
 async def cmd_presets_list(message: Message):
-    names = list_presets(state)
+    names = list_presets(state, message.chat.id)
     if not names:
         await message.reply("Пресетов пока нет. Сохранить текущие настройки: /preset_save <название>")
         return
@@ -537,7 +559,7 @@ async def cmd_preset_delete(message: Message, command: CommandObject):
         await message.reply("Формат: /preset_delete <название>")
         return
     name = command.args.strip()
-    if delete_preset(state, name):
+    if delete_preset(state, message.chat.id, name):
         await message.reply(f"Пресет '{name}' удалён.")
     else:
         await message.reply(f"Пресета '{name}' не было.")
@@ -613,7 +635,7 @@ async def cmd_register(message: Message, command: CommandObject):
 
     thread_id = message.message_thread_id
     name = command.args.strip() if command.args else f"раздел {thread_id}"
-    register_section(state, thread_id, name)
+    register_section(state, message.chat.id, thread_id, name)
     await message.reply(
         f"Раздел '{name}' зарегистрирован (id={thread_id}).\n"
         f"Пока ничего не разрешено — добавляй типы командой /allow <тип> [название раздела].\n"
@@ -636,7 +658,7 @@ async def cmd_unregister(message: Message, command: CommandObject):
     if section is None:
         await message.reply(_not_found_reply(name))
         return
-    unregister_section(state, thread_id)
+    unregister_section(state, message.chat.id, thread_id)
     await message.reply(f"Раздел '{section['name']}' снят с модерации, настройки удалены.")
 
 
@@ -650,7 +672,7 @@ async def cmd_section_on(message: Message, command: CommandObject):
     if section is None:
         await message.reply(_not_found_reply(name))
         return
-    set_section_enabled(state, thread_id, True)
+    set_section_enabled(state, message.chat.id, thread_id, True)
     await message.reply(f"Модерация раздела '{section['name']}' включена.")
 
 
@@ -664,7 +686,7 @@ async def cmd_section_off(message: Message, command: CommandObject):
     if section is None:
         await message.reply(_not_found_reply(name))
         return
-    set_section_enabled(state, thread_id, False)
+    set_section_enabled(state, message.chat.id, thread_id, False)
     await message.reply(f"Модерация раздела '{section['name']}' выключена (бот его не трогает).")
 
 
@@ -678,7 +700,7 @@ async def cmd_adminonly_on(message: Message, command: CommandObject):
     if section is None:
         await message.reply(_not_found_reply(name))
         return
-    set_admin_only(state, thread_id, True)
+    set_admin_only(state, message.chat.id, thread_id, True)
     await message.reply(f"Ультра-режим включён для '{section['name']}': писать теперь может только админ.")
 
 
@@ -692,7 +714,7 @@ async def cmd_adminonly_off(message: Message, command: CommandObject):
     if section is None:
         await message.reply(_not_found_reply(name))
         return
-    set_admin_only(state, thread_id, False)
+    set_admin_only(state, message.chat.id, thread_id, False)
     await message.reply(f"Ультра-режим выключен для '{section['name']}', снова действуют разрешённые типы.")
 
 
@@ -722,7 +744,7 @@ async def cmd_allow(message: Message, command: CommandObject):
         await message.reply(_not_found_reply(name))
         return
 
-    allow_type(state, thread_id, ctype)
+    allow_type(state, message.chat.id, thread_id, ctype)
     await message.reply(f"В разделе '{section['name']}' теперь разрешено: {ctype}")
 
 
@@ -748,7 +770,7 @@ async def cmd_deny(message: Message, command: CommandObject):
         await message.reply(_not_found_reply(name))
         return
 
-    deny_type(state, thread_id, ctype)
+    deny_type(state, message.chat.id, thread_id, ctype)
     await message.reply(f"В разделе '{section['name']}' теперь запрещено: {ctype}")
 
 
@@ -770,7 +792,7 @@ async def cmd_allow_dice(message: Message, command: CommandObject):
         await message.reply(_not_found_reply(name))
         return
 
-    allow_dice_emoji(state, thread_id, emoji)
+    allow_dice_emoji(state, message.chat.id, thread_id, emoji)
     await message.reply(
         f"В разделе '{section['name']}' теперь разрешён dice-эмодзи {emoji}.\n"
         f"Если это первый разрешённый dice-эмодзи — остальные dice больше не проходят."
@@ -795,7 +817,7 @@ async def cmd_deny_dice(message: Message, command: CommandObject):
         await message.reply(_not_found_reply(name))
         return
 
-    deny_dice_emoji(state, thread_id, emoji)
+    deny_dice_emoji(state, message.chat.id, thread_id, emoji)
     await message.reply(f"Dice-эмодзи {emoji} больше не в списке разрешённых для '{section['name']}'.")
 
 
@@ -1056,7 +1078,7 @@ async def cmd_whatis(message: Message):
     target = message.reply_to_message
 
     types = get_content_types(target)
-    section = get_section(state, message.message_thread_id)
+    section = get_section(state, message.chat.id, message.message_thread_id)
     lines = [f"Бот видит типы контента: {', '.join(sorted(types))}"]
     if section:
         allowed = set(section.get("allowed_types", []))
@@ -1209,7 +1231,7 @@ async def _ai_action_allow(message: Message, args: str) -> None:
     thread_id, section = resolve_section(message, section_name)
     if not section:
         raise ValueError(_not_found_reply(section_name))
-    allow_type(state, thread_id, content_type)
+    allow_type(state, message.chat.id, thread_id, content_type)
 
 
 async def _ai_action_deny(message: Message, args: str) -> None:
@@ -1223,21 +1245,21 @@ async def _ai_action_deny(message: Message, args: str) -> None:
     thread_id, section = resolve_section(message, section_name)
     if not section:
         raise ValueError(_not_found_reply(section_name))
-    deny_type(state, thread_id, content_type)
+    deny_type(state, message.chat.id, thread_id, content_type)
 
 
 async def _ai_action_section_on(message: Message, args: str) -> None:
     thread_id, section = resolve_section(message, args.strip() or None)
     if not section:
         raise ValueError(_not_found_reply(args.strip() or None))
-    set_section_enabled(state, thread_id, True)
+    set_section_enabled(state, message.chat.id, thread_id, True)
 
 
 async def _ai_action_section_off(message: Message, args: str) -> None:
     thread_id, section = resolve_section(message, args.strip() or None)
     if not section:
         raise ValueError(_not_found_reply(args.strip() or None))
-    set_section_enabled(state, thread_id, False)
+    set_section_enabled(state, message.chat.id, thread_id, False)
 
 
 async def _ai_action_blacklist_add(message: Message, args: str) -> None:
@@ -1633,7 +1655,7 @@ async def moderate(message: Message):
                     logging.warning(f"Не удалось отправить уведомление о муте: {e}")
             return
 
-    section = get_section(state, thread_id)
+    section = get_section(state, message.chat.id, thread_id)
 
     if section is None or not section.get("enabled", True):
         return  # раздел не зарегистрирован или выключен — не трогаем
