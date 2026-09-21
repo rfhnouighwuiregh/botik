@@ -48,6 +48,7 @@ from state import (
     load_preset,
     list_presets,
     delete_preset,
+    migrate_old_presets,
     get_ai_persona,
     set_ai_persona,
     record_violation,
@@ -563,6 +564,19 @@ async def cmd_preset_delete(message: Message, command: CommandObject):
         await message.reply(f"Пресет '{name}' удалён.")
     else:
         await message.reply(f"Пресета '{name}' не было.")
+
+
+@dp.message(Command("migrate_presets"))
+async def cmd_migrate_presets(message: Message):
+    """Одноразовая команда: находит пресеты, сохранённые до привязки к чату, и переносит сюда."""
+    if not await is_admin(message):
+        await message.reply("Только админ может это делать.")
+        return
+    moved = migrate_old_presets(state, message.chat.id)
+    if moved:
+        await message.reply(f"Перенесены старые пресеты в этот чат: {', '.join(moved)}\nПроверь: /presets")
+    else:
+        await message.reply("Старых (не привязанных к чату) пресетов не нашлось — переносить нечего.")
 
 
 @dp.message(Command("violators"))

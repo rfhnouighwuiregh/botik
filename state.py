@@ -415,6 +415,27 @@ def list_presets(state: dict, chat_id: int) -> list:
     return list(state.get("presets", {}).get(str(chat_id), {}).keys())
 
 
+def migrate_old_presets(state: dict, chat_id: int) -> list:
+    """
+    Одноразовая миграция: до привязки разделов к chat_id пресеты хранились
+    плоско — presets[название] = снимок. Новый формат — presets[chat_id][название].
+    Находит старые записи (по характерным полям снимка) и переносит их
+    в текущий чат. Возвращает список перенесённых имён.
+    """
+    presets = state.setdefault("presets", {})
+    moved = []
+    for key in list(presets.keys()):
+        value = presets[key]
+        if isinstance(value, dict) and "sections" in value and "moderation_enabled" in value:
+            # это старый плоский пресет с именем key, а не {название: снимок} для чата
+            presets.setdefault(str(chat_id), {})[key] = value
+            del presets[key]
+            moved.append(key)
+    if moved:
+        save_state(state)
+    return moved
+
+
 def delete_preset(state: dict, chat_id: int, name: str) -> bool:
     presets = state.get("presets", {}).get(str(chat_id), {})
     if name in presets:
