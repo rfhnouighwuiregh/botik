@@ -1073,6 +1073,33 @@ async def moderate(message: Message):
 
         sender_username = message.from_user.username if message.from_user else None
 
+        # Если это реальный reply (а не автоподставленное Telegram-ом открывающее
+        # сообщение темы) — подмешиваем текст цитируемого сообщения в промпт,
+        # чтобы ИИ отвечала по контексту, а не только по самому упоминанию.
+        quoted_note = ""
+        is_real_reply = (
+            message.reply_to_message
+            and message.reply_to_message.message_id != message.message_thread_id
+        )
+        if is_real_reply:
+            quoted = message.reply_to_message
+            quoted_text = quoted.text or quoted.caption
+            quoted_author = None
+            if quoted.from_user:
+                quoted_author = f"@{quoted.from_user.username}" if quoted.from_user.username else quoted.from_user.full_name
+            author_note = f" (автор: {quoted_author})" if quoted_author else ""
+            if quoted_text:
+                quoted_note = f"\n\n[Ответ на сообщение{author_note}, вот его текст:\n{quoted_text}]"
+            else:
+                # Вложение без текста (фото, стикер, голосовое и т.п.) — ИИ пока не
+                # умеет их «видеть», честно предупреждаем, чтобы не выдумывала содержимое.
+                kinds = get_content_types(quoted)
+                kind_str = ", ".join(sorted(kinds)) if kinds else "без текста"
+                quoted_note = (
+                    f"\n\n[Ответ на сообщение{author_note} без текста (тип: {kind_str}) — "
+                    f"содержимое вложения тебе не показано, не придумывай, что там]"
+                )
+
         history_note = ""
         if message.from_user and is_user_muted(state, message.chat.id, message.from_user.id):
             history = get_user_message_log(state, message.chat.id, message.from_user.id)
@@ -1083,7 +1110,11 @@ async def moderate(message: Message):
                     f"используй их, если он просит амнистию:\n{history_text}]"
                 )
 
-        prompt = f"[от @{sender_username}]: {question}{history_note}" if sender_username else f"{question}{history_note}"
+        prompt = (
+            f"[от @{sender_username}]: {question}{quoted_note}{history_note}"
+            if sender_username else
+            f"{question}{quoted_note}{history_note}"
+        )
 
         await bot.send_chat_action(message.chat.id, "typing")
         answer = await ask_gemini(prompt)
