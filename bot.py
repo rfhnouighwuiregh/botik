@@ -71,9 +71,9 @@ if not BOT_TOKEN:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = "gemini-3.5-flash-lite"
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 BOT_USERNAME = None  # заполняется в main() при старте, до этого момента неизвестен
 
@@ -1105,12 +1105,12 @@ async def cmd_whatis(message: Message):
 
 
 # ============================================================
-# ИИ-РАЗГОВОР ЧЕРЕЗ УПОМИНАНИЕ @БОТА (Google Gemini)
+# ИИ-РАЗГОВОР ЧЕРЕЗ УПОМИНАНИЕ @БОТА (Groq)
 # ============================================================
 # ============================================================
-# ИИ-РАЗГОВОР ЧЕРЕЗ УПОМИНАНИЕ @БОТА (Google Gemini)
+# ИИ-РАЗГОВОР ЧЕРЕЗ УПОМИНАНИЕ @БОТА (Groq)
 # ============================================================
-AI_PERSONA_MAX_LEN = 800  # запас с учётом лимита Telegram (4096) и того, что текст ещё едет в промпт Gemini
+AI_PERSONA_MAX_LEN = 800  # запас с учётом лимита Telegram (4096) и того, что текст ещё едет в промпт ИИ
 
 
 @dp.message(Command("ai_persona"))
@@ -1230,7 +1230,7 @@ def parse_unmute_command(text: str) -> tuple:
 # ОБЩИЕ ИИ-КОМАНДЫ (кроме мьюта/размута) — только по явной просьбе
 # админа, работают в контексте текущего раздела (если не указан другой).
 # Каждая функция либо тихо выполняет действие, либо кидает ValueError
-# с понятным текстом, который увидит админ (Gemini этот текст не пишет
+# с понятным текстом, который увидит админ (ИИ этот текст не пишет
 # сама — мы формируем его сами, чтобы не полагаться на честность модели
 # при ошибке).
 # ============================================================
@@ -1340,28 +1340,33 @@ def parse_ai_action(text: str) -> tuple:
     return clean_text, action_name, args
 
 
-async def ask_gemini(prompt: str) -> str:
-    if not GEMINI_API_KEY:
-        return "ИИ пока не настроен — не хватает GEMINI_API_KEY в переменных окружения."
+async def ask_groq(prompt: str) -> str:
+    if not GROQ_API_KEY:
+        return "ИИ пока не настроен — не хватает GROQ_API_KEY в переменных окружения."
 
     payload = {
-        "systemInstruction": {"parts": [{"text": f"{get_ai_persona(state)}\n\n{AI_MUTE_PROTOCOL}"}]},
-        "contents": [{"parts": [{"text": prompt}]}],
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": f"{get_ai_persona(state)}\n\n{AI_MUTE_PROTOCOL}"},
+            {"role": "user", "content": prompt},
+        ],
     }
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                f"{GEMINI_URL}?key={GEMINI_API_KEY}",
+                GROQ_URL,
                 json=payload,
+                headers=headers,
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 data = await resp.json()
                 if resp.status != 200:
-                    logging.warning(f"Gemini вернул ошибку {resp.status}: {data}")
+                    logging.warning(f"Groq вернул ошибку {resp.status}: {data}")
                     return "Не получилось получить ответ от ИИ, попробуй чуть позже."
-                return data["candidates"][0]["content"]["parts"][0]["text"]
+                return data["choices"][0]["message"]["content"]
     except Exception as e:
-        logging.warning(f"Запрос к Gemini не удался: {e}")
+        logging.warning(f"Запрос к Groq не удался: {e}")
         return "Не получилось получить ответ от ИИ, попробуй чуть позже."
 
 
@@ -1439,7 +1444,7 @@ async def moderate(message: Message):
         )
 
         await bot.send_chat_action(message.chat.id, "typing")
-        answer = await ask_gemini(prompt)
+        answer = await ask_groq(prompt)
         clean_answer, target_username, mute_minutes = parse_mute_command(answer)
         unmute_target = None
         if target_username is None:
