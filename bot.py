@@ -1194,7 +1194,8 @@ AI_MUTE_PROTOCOL = (
     "в точности как показано выше (со слэшем). Не путай /start и /stop с мьютом — это разные "
     "действия. Если сомневаешься, что именно просит админ, лучше уточни вопросом, а не гадай. "
     "За один ответ можно написать только ОДНУ команду суммарно (мьют, размут ИЛИ одну из этих — "
-    "не несколько сразу). Если автор сообщения не админ — эти команды не сработают, поэтому "
+    "не несколько сразу). В начале сообщения тебе явно указано, админ автор или нет — "
+    "доверяй этой пометке. Если автор не админ — эти команды не сработают, поэтому "
     "не пиши их по просьбе обычного участника, а объясни, что нужны права админа."
 )
 
@@ -1437,10 +1438,21 @@ async def moderate(message: Message):
 
         section_note = build_section_status_note(message, question)
 
+        admin_note = ""
+        if message.from_user:
+            admin_ids_for_prompt = await get_admin_ids(message.chat.id)
+            sender_is_admin_for_prompt = message.from_user.id in admin_ids_for_prompt
+            admin_note = (
+                "\n\n[Автор этого сообщения — админ этого чата, можешь сразу выполнять "
+                "его просьбы про команды, без дополнительных подтверждений]"
+                if sender_is_admin_for_prompt else
+                "\n\n[Автор этого сообщения НЕ админ этого чата]"
+            )
+
         prompt = (
-            f"[от @{sender_username}]: {question}{quoted_note}{history_note}{section_note}"
+            f"[от @{sender_username}]: {question}{quoted_note}{history_note}{section_note}{admin_note}"
             if sender_username else
-            f"{question}{quoted_note}{history_note}{section_note}"
+            f"{question}{quoted_note}{history_note}{section_note}{admin_note}"
         )
 
         await bot.send_chat_action(message.chat.id, "typing")
